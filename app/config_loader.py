@@ -81,14 +81,9 @@ class AiConfig(BaseModel):
 class PersonsConfig(BaseModel):
     me: list[str] = Field(default_factory=list)
     partner: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def at_least_one_name(self) -> "PersonsConfig":
-        if not self.me and not self.partner:
-            raise ValueError(
-                "persons.me oder persons.partner muss mindestens einen Namen enthalten."
-            )
-        return self
+    # Empty lists are allowed – the pre_classifier discovers persons automatically.
+    # load_config() emits a warning when both are empty (logic_gate will return
+    # "unknown" for all documents in that case).
 
 
 class DatabaseConfig(BaseModel):
