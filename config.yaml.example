@@ -1,0 +1,182 @@
+# =============================================================================
+# KI-Dokumenten-Archiv – Beispiel-Konfigurationsdatei
+# Kopiere diese Datei nach config.yaml und passe alle Werte an.
+# Diese Datei wird als Volume in die Container gemountet.
+# KEINE Werte dürfen direkt im Python-Code hardcodiert sein.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. VERZEICHNISSE / PFADE
+#    Alle Pfade beziehen sich auf den HOST-Rechner und werden per Volume-Mount
+#    in die Container weitergeleitet.
+# ---------------------------------------------------------------------------
+paths:
+  # Eingangsordner: Hier legt der Scanner die rohen PDF/TIF-Scans ab.
+  scan_input_dir: /data/scans
+
+  # Zwischenablage nach der Patch-T-Erkennung und dem Splitting.
+  split_output_dir: /data/split
+
+  # Ordner für analysierte Dokumente (mit Metadaten-Sidecar-JSON).
+  analyzed_output_dir: /data/analyzed
+
+  # Quarantäne für Dokumente, die den confidence_threshold nicht erreichen.
+  quarantine_dir: /data/quarantine
+
+  # Persistenter Speicher für die MariaDB-Daten (Host-Pfad für Docker Volume).
+  db_data_dir: /data/mariadb
+
+  # Speicherort für Paperless-ngx Consume-Verzeichnis (falls direktes Einlegen
+  # statt REST-API gewünscht wird).
+  paperless_consume_dir: /data/paperless/consume
+
+  # Verzeichnis für temporäre Arbeitsdateien der KI-Pipeline.
+  tmp_dir: /data/tmp
+
+# ---------------------------------------------------------------------------
+# 2. GPU-ZUWEISUNG
+#    Steuert, welche GPU jeder Dienst nutzt.
+#    Wert: Ganzzahl (Device-ID) oder "none" für CPU-Betrieb.
+# ---------------------------------------------------------------------------
+gpu:
+  # GPU 0 (Tesla P100) – Vision-Analyse und LLM-Inferenz.
+  vision_gpu_id: 0
+
+  # GPU 1 (Tesla P4) – Text-Embeddings (Sentence-Transformers).
+  embedding_gpu_id: 1
+
+  # Fallback auf CPU, wenn keine GPU verfügbar ist (true/false).
+  allow_cpu_fallback: false
+
+# ---------------------------------------------------------------------------
+# 3. KI-SCHWELLENWERTE
+#    Steuern das Verhalten der KI-Analyse-Pipeline.
+# ---------------------------------------------------------------------------
+ai:
+  # Minimale Konfidenz (0.0–1.0) für die Metadaten-Extraktion.
+  # Dokumente unterhalb dieses Werts landen in quarantine_dir.
+  confidence_threshold: 0.75
+
+  # Minimale Konfidenz für OCR-Ergebnisse (Tesseract / Vision-LLM).
+  ocr_confidence_threshold: 0.80
+
+  # Sprache für OCR (ISO 639-3, z. B. deu, eng, fra).
+  ocr_language: deu
+
+  # Modell-ID für die Metadaten-Extraktion (Hugging Face oder lokaler Pfad).
+  llm_model_id: "mistralai/Mistral-7B-Instruct-v0.2"
+
+  # Modell-ID für die Text-Embeddings (muss 768-dim ausgeben).
+  embedding_model_id: "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+
+  # Maximale Tokenlänge für LLM-Prompts.
+  llm_max_tokens: 512
+
+  # Batch-Größe für Embedding-Generierung.
+  embedding_batch_size: 32
+
+# ---------------------------------------------------------------------------
+# 4. PERSONEN / EMPFÄNGER-LOGIK
+#    Die Logic-Gate-Komponente nutzt diese Namen, um eingehende Dokumente
+#    dem richtigen Empfänger zuzuordnen.
+#    Groß-/Kleinschreibung wird ignoriert beim Abgleich.
+# ---------------------------------------------------------------------------
+persons:
+  # Vollständige Namen für den primären Nutzer ("Ich").
+  # Mehrere Einträge möglich.
+  me:
+    - "Max Mustermann"
+    - "M. Mustermann"
+
+  # Vollständige Namen für weitere Empfänger.
+  partner:
+    - "Erika Musterfrau"
+    - "E. Musterfrau"
+
+  # Weitere Empfänger-Kategorien können beliebig hinzugefügt werden:
+  # company:
+  #   - "Musterfirma GmbH"
+
+# ---------------------------------------------------------------------------
+# 5. TAG-MAPPING
+#    Ordnet erkannte Dokumenttypen Paperless-ngx Tags zu.
+#    Schlüssel: interner Dokumenttyp (von der KI erkannt)
+#    Wert: Paperless-ngx Tag-Name (muss in Paperless existieren)
+# ---------------------------------------------------------------------------
+tag_mapping:
+  Rechnung: "Rechnung"
+  Kontoauszug: "Kontoauszug"
+  Versicherung: "Versicherung"
+  Behördenpost: "Behörde"
+  Arztbrief: "Gesundheit"
+  Vertrag: "Vertrag"
+  Werbung: "Werbung"
+  Sonstiges: "Unsortiert"
+
+# ---------------------------------------------------------------------------
+# 6. DATENBANK (MariaDB 11.7)
+# ---------------------------------------------------------------------------
+database:
+  host: mariadb
+  port: 3306
+  name: document_archive
+  user: archive_user
+  # WICHTIG: Passwort über Umgebungsvariable DB_PASSWORD setzen,
+  # nicht direkt hier eintragen!
+  # Das Feld wird aus der Env-Var DB_PASSWORD gelesen, falls leer.
+  password: ""
+
+  # Verbindungs-Pool-Größe.
+  pool_size: 5
+
+  # HNSW-Index Parameter für Vektorsuche.
+  hnsw_m: 16          # Anzahl der Verbindungen pro Knoten (16–64 empfohlen).
+  hnsw_ef_search: 64  # Suchtiefe bei Anfragen (höher = genauer, langsamer).
+
+# ---------------------------------------------------------------------------
+# 7. PAPERLESS-NGX REST-API
+# ---------------------------------------------------------------------------
+paperless:
+  base_url: "http://paperless-ngx:8000"
+  # API-Token über Env-Var PAPERLESS_API_TOKEN setzen.
+  api_token: ""
+  # Standard-Dokumententyp, falls die KI keine Zuordnung findet.
+  default_document_type: "Eingehend"
+
+# ---------------------------------------------------------------------------
+# 8. WATCHER-EINSTELLUNGEN
+# ---------------------------------------------------------------------------
+watcher:
+  # Scanauflösung (DPI), die der Scanner liefert. Dient zur Qualitätsprüfung.
+  expected_dpi: 600
+
+  # Polling-Intervall in Sekunden, wenn kein inotify verfügbar ist.
+  poll_interval_seconds: 5
+
+  # Minimale Dateigröße in Bytes, bevor eine Datei als vollständig gilt.
+  min_file_size_bytes: 10240
+
+  # Warte-Zeit in Sekunden nach der letzten Dateiänderung (stabile Datei).
+  file_stable_wait_seconds: 3
+
+# ---------------------------------------------------------------------------
+# 9. RAG-CHAT API (FastAPI)
+# ---------------------------------------------------------------------------
+rag_chat:
+  host: "0.0.0.0"
+  port: 8080
+  # Anzahl der Ergebnisse, die bei einer Vektorsuche zurückgegeben werden.
+  top_k_results: 5
+  # CORS-Ursprünge (kommagetrennte Liste oder "*" für alle).
+  cors_origins: "*"
+
+# ---------------------------------------------------------------------------
+# 10. LOGGING
+# ---------------------------------------------------------------------------
+logging:
+  # Log-Level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: INFO
+  # Log-Format: json (für Log-Aggregatoren) oder text (für Menschen)
+  format: json
+  # Log-Ausgabe: stdout und/oder Datei
+  log_file: /data/logs/archive.log
