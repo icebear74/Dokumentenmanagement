@@ -36,3 +36,5 @@ requests>=2.32.0,<3.0         # Paperless-ngx REST-API
 # --- Hilfsbibliotheken ---
 python-multipart>=0.0.9,<1.0  # FastAPI Datei-Upload
 httpx>=0.27.0,<1.0            # Async HTTP-Client (für Tests)
+rich>=13.7.0,<14.0            # Formatierte Konsolenausgabe (Pre-Classifier Berichte)
+

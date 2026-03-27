@@ -40,6 +40,14 @@ from typing import Any
 import requests
 
 from config_loader import AppConfig, configure_logging, load_config
+from db_rules import (
+    RulesCache,
+    ensure_defaults,
+    _DEFAULT_PRECLASSIFIER_PHASE1_SYSTEM,
+    _DEFAULT_PRECLASSIFIER_PHASE1_USER_TEMPLATE,
+    _DEFAULT_PRECLASSIFIER_PHASE2_SYSTEM,
+    _DEFAULT_PRECLASSIFIER_PHASE2_USER_TEMPLATE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,91 +70,36 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# LLM-Prompts
+# Prompt-Accessor – laden aus DB, Fallback auf hardcodierte Konstanten
+# (die Konstanten sind in db_rules.py definiert und identisch mit den
+#  SQL-Seed-Daten, sodass der Inhalt immer konsistent ist)
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PHASE1 = """\
-Du bist ein erfahrener Dokumentenarchivarius für deutschsprachige Privat- und \
-Geschäftsdokumente. Du hast tiefes Wissen über:
-- Deutsche Behörden, Formulare und amtliche Dokumente
-- Medizinische Dokumente (Arztbriefe, Befunde, Krankenkassen-Schreiben)
-- Finanzielle Dokumente (Steuer, Versicherung, Banken)
-- Wohn- und Mietangelegenheiten
-- Rechtliche Schreiben und Verträge
+# Module-level cache reference – set in main() after DB connection.
+_rules_cache: RulesCache | None = None
 
-Deine Stärke: Du erkennst den ECHTEN Kontext eines Dokuments, nicht nur \
-Schlüsselwörter. Antworte IMMER ausschließlich mit einem validen JSON-Objekt, \
-ohne Markdown-Blöcke oder erklärenden Text."""
 
-_USER_PHASE1 = """\
-Analysiere den folgenden Dokumententext und erstelle eine strukturierte \
-Klassifizierung.
+def _sys(name: str, default: str) -> str:
+    """Gibt den system-Prompt für den pre_classifier aus DB zurück."""
+    if _rules_cache is not None:
+        return _rules_cache.get_prompt("pre_classifier", name, "system", default=default)
+    return default
 
-Dokumententext (OCR):
----
-{text}
----
 
-Antworte mit GENAU diesem JSON (alle Felder angeben):
-{{
-  "document_type": "Exakter Dokumenttyp auf Deutsch",
-  "topic_tags": ["max. 6 semantische Themen-Tags auf Deutsch, kurz"],
-  "persons": [
-    {{"name": "Vollständiger Name", "role": "Funktion: Absender/Empfänger/Arzt/Anwalt/etc."}}
-  ],
-  "organizations": ["Organisation 1", "Organisation 2"],
-  "sender": "Hauptabsender (Name oder Firma)",
-  "recipient": "Empfänger-Name(n) aus dem Dokument",
-  "summary": "Ein präziser Satz: Worum geht es?",
-  "action_required": false,
-  "action_description": "Nur wenn action_required true: Was ist zu tun?",
-  "confidence": 0.85
-}}"""
+def _tpl(name: str, default: str) -> str:
+    """Gibt das user_template für den pre_classifier aus DB zurück."""
+    if _rules_cache is not None:
+        return _rules_cache.get_prompt("pre_classifier", name, "user_template", default=default)
+    return default
 
-_SYSTEM_PHASE2 = """\
-Du bist ein erfahrener Dokumentenarchivarius. Du analysierst eine GESAMTE \
-Dokumentensammlung auf übergreifende Muster, Zusammenhänge und wiederkehrende \
-Themen. Dein Ziel: eine optimale Tag-Taxonomie für ein Dokumenten-Archiv \
-vorschlagen, die Verbindungen zwischen Dokumenten sichtbar macht.
-Antworte IMMER ausschließlich mit einem validen JSON-Objekt."""
 
-_USER_PHASE2 = """\
-Hier sind die Analysen von {n} gescannten Dokumenten. Analysiere sie als \
-GESAMTHEIT und erkenne übergreifende Muster.
-
-Dokument-Zusammenfassungen:
----
-{summaries}
----
-
-Antworte mit GENAU diesem JSON:
-{{
-  "overall_assessment": "Gesamteinschätzung der Sammlung in 2-3 Sätzen",
-  "tag_taxonomy": [
-    {{
-      "tag": "Tag-Name auf Deutsch",
-      "category": "Oberkategorie (Gesundheit/Finanzen/Behörde/Wohnen/Arbeit/Recht/Sonstiges)",
-      "rationale": "Warum dieser Tag? Welche Dokumente/Muster begründen ihn?",
-      "affected_files": ["datei1.pdf"],
-      "priority": "hoch"
-    }}
-  ],
-  "connections": [
-    {{
-      "pattern": "Kurze Beschreibung des erkannten Musters oder Zusammenhangs",
-      "files": ["datei1.pdf", "datei2.pdf"],
-      "suggested_tag": "Empfohlener Tag für diesen Zusammenhang"
-    }}
-  ],
-  "recommended_correspondents": [
-    {{
-      "name": "Name der Person oder Organisation",
-      "type": "Person oder Organisation",
-      "rationale": "Welche Rolle spielt diese Person/Org in der Sammlung?",
-      "document_count": 3
-    }}
-  ]
-}}"""
+# ---------------------------------------------------------------------------
+# Hardcoded-Fallback Strings (identisch mit _DEFAULT_PRECLASSIFIER_* in db_rules.py)
+# ---------------------------------------------------------------------------
+_SYSTEM_PHASE1 = _DEFAULT_PRECLASSIFIER_PHASE1_SYSTEM
+_USER_PHASE1   = _DEFAULT_PRECLASSIFIER_PHASE1_USER_TEMPLATE
+_SYSTEM_PHASE2 = _DEFAULT_PRECLASSIFIER_PHASE2_SYSTEM
+_USER_PHASE2   = _DEFAULT_PRECLASSIFIER_PHASE2_USER_TEMPLATE
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +397,7 @@ def _analyse_single(pdf_path: Path, llm: ChatLLMClient) -> DocumentPreAnalysis:
         )
 
     try:
-        raw = llm.chat(_SYSTEM_PHASE1, _USER_PHASE1.format(text=text))
+        raw = llm.chat(_sys("phase1", _SYSTEM_PHASE1), _tpl("phase1", _USER_PHASE1).format(text=text))
         d = _parse_json(raw)
         return DocumentPreAnalysis(
             filename=pdf_path.name,
@@ -526,8 +479,8 @@ def _synthesize(
         summaries = _build_summary_block(batch)
         try:
             raw = llm.chat(
-                _SYSTEM_PHASE2,
-                _USER_PHASE2.format(n=len(batch), summaries=summaries),
+                _sys("phase2", _SYSTEM_PHASE2),
+                _tpl("phase2", _USER_PHASE2).format(n=len(batch), summaries=summaries),
             )
             batch_results.append(_parse_json(raw))
         except Exception as exc:
@@ -549,7 +502,7 @@ def _synthesize(
             f"{meta_summaries}"
         )
         try:
-            raw = llm.chat(_SYSTEM_PHASE2, meta_prompt)
+            raw = llm.chat(_sys("phase2", _SYSTEM_PHASE2), meta_prompt)
             final = _parse_json(raw)
         except Exception as exc:
             logger.error("Meta-Synthese fehlgeschlagen: %s", exc)
@@ -646,14 +599,10 @@ class PreClassifier:
 
     def run(self, scan_dir: Path, output_dir: Path) -> PreAnalysisReport:
         """Führt beide Analysephasen durch und gibt den Bericht zurück."""
+        extensions = ("*.pdf", "*.PDF", "*.tif", "*.tiff", "*.TIF", "*.TIFF")
         pdf_files = sorted(
-            scan_dir.glob("*.pdf")
-            | scan_dir.glob("*.PDF")
-            | scan_dir.glob("*.tif")
-            | scan_dir.glob("*.tiff")
-            | scan_dir.glob("*.TIF")
-            | scan_dir.glob("*.TIFF"),
-            key=lambda p: p.name,
+            (p for ext in extensions for p in scan_dir.glob(ext)),
+            key=lambda p: p.name.lower(),
         )
 
         if not pdf_files:
@@ -1151,6 +1100,45 @@ Via Docker Compose:
         _print(f"LLM-Backend: Ollama @ {url} (Modell: {model})")
 
     classifier = PreClassifier(config=config, llm=llm)
+
+    # DB-Verbindung für Prompt-Cache (optional – pre_classifier läuft auch ohne DB)
+    import mysql.connector as _mc
+    try:
+        _conn = _mc.connect(
+            host=config.database.host,
+            port=config.database.port,
+            database=config.database.name,
+            user=config.database.user,
+            password=config.database.password,
+            charset="utf8mb4",
+            connection_timeout=5,
+        )
+        if config.rules_cache.seed_defaults_on_startup:
+            ensure_defaults(
+                _conn,
+                persons_me=config.persons.me,
+                persons_partner=config.persons.partner,
+                tag_mapping=config.tag_mapping,
+            )
+        global _rules_cache
+        _rules_cache = RulesCache(
+            conn_factory=lambda: _mc.connect(
+                host=config.database.host,
+                port=config.database.port,
+                database=config.database.name,
+                user=config.database.user,
+                password=config.database.password,
+                charset="utf8mb4",
+            ),
+            ttl_seconds=config.rules_cache.ttl_seconds,
+        )
+        _conn.close()
+        _print("DB verbunden – Prompts werden aus Datenbank geladen.")
+    except Exception as exc:
+        logger.warning(
+            "DB nicht erreichbar (%s) – verwende hardcodierte Fallback-Prompts.", exc
+        )
+
     report, report_path = classifier.run(scan_dir=scan_dir, output_dir=output_dir)
     print_report(report, report_path)
 

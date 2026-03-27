@@ -171,8 +171,80 @@ rag_chat:
   cors_origins: "*"
 
 # ---------------------------------------------------------------------------
-# 10. LOGGING
+# 11. DATENBANKBASIERTE REGELN & PROMPT-CACHE
+#     Alle Zuweisungsregeln und LLM-Prompts kommen aus der Datenbank.
+#     Änderungen wirken nach dem nächsten Cache-Refresh, ohne Neustart.
+#
+#     Regeln verwalten (direkt in MariaDB):
+#
+#     -- Neue Person als Empfänger "me" anlegen:
+#     INSERT INTO assignment_rules
+#       (rule_type, match_field, match_value, match_mode, assign_value, priority)
+#     VALUES ('recipient', 'recipient_name', 'Max Mustermann', 'exact', 'me', 100);
+#
+#     -- Alle aktiven Regeln anzeigen (nach Priorität):
+#     SELECT id, rule_type, match_field, match_value, assign_value, priority
+#     FROM assignment_rules WHERE is_active=1 ORDER BY priority DESC;
+#
+#     -- Regel deaktivieren (nicht löschen!):
+#     UPDATE assignment_rules SET is_active=0 WHERE id=<id>;
+#
+#     -- Prompt anpassen (z.B. ai_analyzer verfeinern):
+#     UPDATE llm_prompts SET content='...neuer Prompt...'
+#     WHERE service='ai_analyzer' AND name='default' AND prompt_type='user_template';
 # ---------------------------------------------------------------------------
+rules_cache:
+  # Cache-TTL in Sekunden: nach dieser Zeit werden Regeln/Prompts neu geladen.
+  # Niedrig (10–30s): Änderungen wirken schnell, etwas mehr DB-Last.
+  # Hoch (120–3600s): Weniger DB-Last, Änderungen wirken verzögert.
+  ttl_seconds: 60
+
+  # Beim Start: Standard-Prompts in DB eintragen (INSERT IGNORE).
+  # Bestehende, angepasste Einträge werden NICHT überschrieben.
+  seed_defaults_on_startup: true
+
+  # Beim Start: Personen aus config.yaml als Empfänger-Regeln in DB eintragen.
+  # Nur wenn noch keine Empfänger-Regeln in der DB vorhanden sind.
+  seed_persons_to_db: true
+
+# ---------------------------------------------------------------------------
+# 12. PRE-KLASSIFIZIERUNG (Voranalyse vor dem ersten Pipeline-Durchlauf)
+#     Einmalig ausführen, um Tags und Kontakte aus den Dokumenten zu entdecken.
+#     Ausgabe: NUR VORSCHLAGSLISTEN – keine automatische Paperless-Anlage.
+#
+#     Aufruf:
+#       docker compose --profile preclass up ollama
+#       docker compose --profile preclass exec ollama ollama pull mistral
+#       docker compose --profile preclass run --rm pre_classifier
+# ---------------------------------------------------------------------------
+pre_classifier:
+  # LLM-Backend: "ollama" (lokal, empfohlen für Datenschutz) oder "openai"
+  llm_backend: ollama
+
+  # Ollama-Einstellungen
+  # Modell-Empfehlungen (nach Qualität, lokal):
+  #   mistral      – 7B, gut für Deutsch, schnell (~4 GB VRAM)
+  #   llama3.1     – 8B, sehr gut, mehrsprachig (~5 GB VRAM)
+  #   phi4         – 14B, hervorragend, weniger VRAM (~9 GB VRAM)
+  #   llama3.3:70b – beste Qualität, benötigt ~40 GB VRAM
+  ollama_base_url: "http://ollama:11434"
+  ollama_model: "mistral"
+
+  # OpenAI-Einstellungen (benötigt OPENAI_API_KEY als Umgebungsvariable)
+  # Vorteil: Beste Erkennungsqualität, kein lokales Modell nötig.
+  # Datenschutz-Hinweis: Dokumentinhalt wird an OpenAI übermittelt!
+  openai_model: "gpt-4o-mini"
+
+  # Bei LLM-Ausfall trotzdem weitermachen (leere Ergebnisse statt Abbruch)
+  allow_llm_fallback: true
+
+  # Ausgabeverzeichnis für JSON-Bericht
+  report_output_dir: /data/pre_analysis
+
+  # Maximale Dokumente pro Kontext-Synthese-Batch (Phase 2)
+  # Größere Batches = bessere Mustererkennung, aber längere Antwortzeiten
+  synthesis_batch_size: 25
+
 logging:
   # Log-Level: DEBUG, INFO, WARNING, ERROR, CRITICAL
   level: INFO

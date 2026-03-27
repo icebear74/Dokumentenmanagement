@@ -67,3 +67,11 @@ CMD ["python", "paperless_push.py"]
 FROM base AS rag_chat
 EXPOSE 8080
 CMD ["python", "main.py"]
+
+# =============================================================================
+# Stage 8: Pre-Classifier (Voranalyse & Tag/Kontakt-Generierung)
+# Profil: preclass – wird nur manuell gestartet, nicht Teil der Pipeline.
+# GPU: nicht benötigt (LLM läuft in Ollama-Container)
+# =============================================================================
+FROM base AS pre_classifier
+CMD ["python", "pre_classifier.py"]

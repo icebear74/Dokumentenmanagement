@@ -208,3 +208,67 @@ networks:
 
 volumes:
   mariadb_data:
+
+  # ---------------------------------------------------------------------------
+  # Ollama – Lokales LLM für intelligente Voranalyse
+  # Profil "preclass": wird nur für den Pre-Classifier gestartet.
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: doc_ollama
+    profiles: ["preclass"]
+    restart: no
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${VISION_GPU_ID:-0}
+    volumes:
+      - ${OLLAMA_DATA_DIR:-/data/ollama}:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VISION_GPU_ID:-0}"]
+              capabilities: [gpu]
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # Pre-Classifier – Zweiphasige KI-Voranalyse (Dokumenttypen, Tags, Kontakte)
+  # Liest Prompts und Regeln aus der DB (llm_prompts, assignment_rules).
+  # Ausgabe: Vorschlagslisten – NICHTS wird automatisch in Paperless angelegt.
+  #
+  # Verwendung:
+  #   docker compose --profile preclass up ollama          # Ollama starten
+  #   docker compose --profile preclass exec ollama \
+  #       ollama pull mistral                              # Modell laden
+  #   docker compose --profile preclass run --rm \
+  #       pre_classifier                                   # Analyse starten
+  # ---------------------------------------------------------------------------
+  pre_classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: pre_classifier
+    container_name: doc_pre_classifier
+    profiles: ["preclass"]
+    restart: no
+    env_file: .env
+    environment:
+      SERVICE_NAME: pre_classifier
+      NVIDIA_VISIBLE_DEVICES: "none"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${SCAN_INPUT_DIR:-/data/scans}:/data/scans:ro
+      - ${TMP_DIR:-/data/tmp}:/data/tmp
+      - ${LOG_DIR:-/data/logs}:/data/logs
+      - ${PRE_ANALYSIS_DIR:-/data/pre_analysis}:/data/pre_analysis
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - doc_net
+

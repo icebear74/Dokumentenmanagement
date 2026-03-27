@@ -4,6 +4,10 @@ ai_analyzer.py – Metadaten-Extraktion aus gescannten Dokumenten.
 Überwacht split_output_dir, führt OCR + LLM-Analyse durch und
 speichert Ergebnisse als JSON-Sidecar sowie in der Datenbank.
 
+Der LLM-Prompt kommt aus der Datenbank (Tabelle llm_prompts,
+service='ai_analyzer'). Änderungen am Prompt wirken nach dem nächsten
+Cache-Refresh ohne Container-Neustart.
+
 GPU: vision_gpu_id aus der Konfiguration (Standard: GPU 0, Tesla P100).
 """
 
@@ -21,27 +25,32 @@ import fitz  # PyMuPDF
 import mysql.connector
 
 from config_loader import AppConfig, configure_logging, load_config
+from db_rules import (
+    RulesCache,
+    ensure_defaults,
+    _DEFAULT_AI_ANALYZER_SYSTEM,
+    _DEFAULT_AI_ANALYZER_USER_TEMPLATE,
+)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# LLM-Prompt-Template (keine Pfade/IDs hardcodiert)
-# ---------------------------------------------------------------------------
-_METADATA_PROMPT = """
-Analysiere den folgenden deutschen Dokumententext und extrahiere die Metadaten.
-Antworte AUSSCHLIESSLICH mit einem gültigen JSON-Objekt mit diesen Feldern:
-- sender: Absender (Name/Firma oder null)
-- document_date: Datum auf dem Dokument (Format YYYY-MM-DD oder null)
-- document_type: Typ (Rechnung, Kontoauszug, Versicherung, Behördenpost, Arztbrief, Vertrag, Werbung, Sonstiges)
-- reference_number: Aktenzeichen/Rechnungsnummer oder null
-- confidence: Deine Gesamtkonfidenz (0.0–1.0)
-- recipient_names: Liste der im Dokument genannten Empfängernamen (leer wenn keine gefunden)
+# The prompt template is now loaded from the database (llm_prompts table).
+# _DEFAULT_AI_ANALYZER_USER_TEMPLATE is the fallback used if the DB entry
+# is missing or the DB is unavailable.
 
-Dokumententext:
-{text}
+# Module-level cache reference – set during main() startup.
+_rules_cache: RulesCache | None = None
 
-JSON:
-"""
+
+def _get_prompt_template() -> str:
+    """Returns the user prompt template, preferring the DB version."""
+    if _rules_cache is not None:
+        return _rules_cache.get_prompt(
+            "ai_analyzer", "default", "user_template",
+            default=_DEFAULT_AI_ANALYZER_USER_TEMPLATE,
+        )
+    return _DEFAULT_AI_ANALYZER_USER_TEMPLATE
+
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +147,8 @@ def analyze_document(pdf_path: Path, config: AppConfig) -> AnalysisResult:
 
     # Begrenze Text für den Prompt
     prompt_text = ocr_text[:4000] if len(ocr_text) > 4000 else ocr_text
-    prompt = _METADATA_PROMPT.format(text=prompt_text)
+    # Prompt-Template aus DB laden (Fallback auf hardcodierten Standard)
+    prompt = _get_prompt_template().format(text=prompt_text)
 
     raw_json: dict = {}
     try:
@@ -302,6 +312,8 @@ def _move_file(src: Path, dest_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _rules_cache
+
     config = load_config()
     configure_logging(config)
 
@@ -315,7 +327,33 @@ def main() -> None:
         autocommit=False,
     )
 
-    logger.info("AI-Analyzer gestartet. Überwache %s …", config.paths.split_output_dir)
+    # Standard-Prompts und Regeln beim Start sicherstellen
+    if config.rules_cache.seed_defaults_on_startup:
+        ensure_defaults(
+            conn,
+            persons_me=config.persons.me,
+            persons_partner=config.persons.partner,
+            tag_mapping=config.tag_mapping,
+        )
+
+    # RulesCache für Prompt-Ladefunktionen initialisieren
+    _rules_cache = RulesCache(
+        conn_factory=lambda: mysql.connector.connect(
+            host=config.database.host,
+            port=config.database.port,
+            database=config.database.name,
+            user=config.database.user,
+            password=config.database.password,
+            charset="utf8mb4",
+        ),
+        ttl_seconds=config.rules_cache.ttl_seconds,
+    )
+
+    logger.info(
+        "AI-Analyzer gestartet. Prompt-Quelle: DB (service=ai_analyzer). "
+        "Überwache %s …",
+        config.paths.split_output_dir,
+    )
     try:
         while True:
             process_pending_files(config, conn)

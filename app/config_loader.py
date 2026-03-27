@@ -152,6 +152,54 @@ class LoggingConfig(BaseModel):
         return v.upper()
 
 
+class RulesCacheConfig(BaseModel):
+    """Steuerung des datenbankbasierten Regel- und Prompt-Caches."""
+    # Wie lange gecachte Regeln gültig sind (Sekunden).
+    ttl_seconds: int = Field(60, ge=10, le=3600)
+    # Beim Start Standard-Prompts in DB einfügen (INSERT IGNORE – kein Überschreiben).
+    seed_defaults_on_startup: bool = True
+    # Beim Start Personen aus config.yaml als Empfänger-Regeln in DB eintragen
+    # (nur wenn noch keine Empfänger-Regeln vorhanden sind).
+    seed_persons_to_db: bool = True
+
+
+class PreClassifierConfig(BaseModel):
+    """Konfiguration für das Pre-Klassifizierungs-Tool."""
+    # LLM-Backend: "ollama" (lokal, empfohlen) oder "openai"
+    llm_backend: str = "ollama"
+
+    # Ollama-Einstellungen
+    ollama_base_url: str = "http://ollama:11434"
+    ollama_model: str = "mistral"
+
+    # OpenAI-Einstellungen (benötigt OPENAI_API_KEY als Umgebungsvariable)
+    openai_model: str = "gpt-4o-mini"
+
+    # Weitermachen wenn LLM nicht erreichbar (dann leere Analyseergebnisse)
+    allow_llm_fallback: bool = True
+
+    # Ausgabeverzeichnis für den JSON-Bericht
+    report_output_dir: str = "/data/pre_analysis"
+
+    # Maximale Dokumente pro Kontext-Synthese-Batch
+    synthesis_batch_size: int = Field(25, ge=5, le=100)
+
+    @field_validator("llm_backend")
+    @classmethod
+    def valid_backend(cls, v: str) -> str:
+        allowed = {"ollama", "openai"}
+        if v.lower() not in allowed:
+            raise ValueError(f"llm_backend muss eines von {allowed} sein: {v}")
+        return v.lower()
+
+    @field_validator("report_output_dir", mode="before")
+    @classmethod
+    def must_be_absolute(cls, v: str) -> str:
+        if not Path(v).is_absolute():
+            raise ValueError(f"report_output_dir muss absolut sein: {v}")
+        return v
+
+
 class AppConfig(BaseModel):
     paths: PathsConfig
     gpu: GpuConfig
@@ -162,6 +210,8 @@ class AppConfig(BaseModel):
     paperless: PaperlessConfig
     watcher: WatcherConfig = Field(default_factory=WatcherConfig)
     rag_chat: RagChatConfig = Field(default_factory=RagChatConfig)
+    rules_cache: RulesCacheConfig = Field(default_factory=RulesCacheConfig)
+    pre_classifier: PreClassifierConfig = Field(default_factory=PreClassifierConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
@@ -202,6 +252,16 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     raw = _apply_env_overrides(raw)
 
     config = AppConfig(**raw)
+
+    if not config.persons.me and not config.persons.partner:
+        logger.warning(
+            "persons.me und persons.partner sind beide leer. "
+            "Die Logic-Gate-Komponente nutzt ausschließlich DB-Regeln zur "
+            "Empfänger-Zuweisung. Füge Empfänger-Regeln in der Datenbank ein:\n"
+            "  INSERT INTO assignment_rules "
+            "(rule_type, match_field, match_value, match_mode, assign_value, priority) "
+            "VALUES ('recipient','recipient_name','Dein Name','exact','me',100);"
+        )
 
     logger.info(
         "Konfiguration erfolgreich geladen. "
