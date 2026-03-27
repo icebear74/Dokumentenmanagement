@@ -25,7 +25,7 @@ Patch-T-Muster (abgeleitet aus Code-39 Zeichen 'T'):
 
 import argparse
 import sys
-from datetime import datetime, date
+from datetime import date
 from pathlib import Path
 
 try:

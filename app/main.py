@@ -12,7 +12,6 @@ Endpunkte:
 from __future__ import annotations
 
 import logging
-import os
 import uuid as uuid_module
 from contextlib import asynccontextmanager
 from typing import Any

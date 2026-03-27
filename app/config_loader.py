@@ -93,7 +93,7 @@ class PersonsConfig(BaseModel):
 
 class DatabaseConfig(BaseModel):
     host: str = "mariadb"
-    port: int = Field(3306, ge=1, le=65535)
+    port: int = Field(3306, ge=1, le=65534)
     name: str = "document_archive"
     user: str = "archive_user"
     password: str = ""
@@ -138,7 +138,7 @@ class WatcherConfig(BaseModel):
 
 class RagChatConfig(BaseModel):
     host: str = "0.0.0.0"
-    port: int = Field(8080, ge=1024, le=65535)
+    port: int = Field(8080, ge=1024, le=65534)
     top_k_results: int = Field(5, ge=1, le=100)
     cors_origins: str = "*"
 
