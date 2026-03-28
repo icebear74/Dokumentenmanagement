@@ -182,8 +182,8 @@ CREATE TABLE IF NOT EXISTS `assignment_rules` (
   `rule_type`    ENUM('recipient','tag','correspondent') NOT NULL
                    COMMENT 'Was wird zugewiesen?',
   `match_field`  ENUM('sender','recipient_name','document_type',
-                      'organization','keyword') NOT NULL
-                   COMMENT 'Gegen welches Dokumentfeld wird geprüft?',
+                      'organization','keyword','llm_tag') NOT NULL
+                   COMMENT 'Gegen welches Dokumentfeld wird geprüft? llm_tag=LLM-extrahierte topic_tags',
   `match_value`  VARCHAR(255) NOT NULL
                    COMMENT 'Zu suchender Wert (case-insensitive)',
   `match_mode`   ENUM('exact','contains','startswith','regex') NOT NULL
@@ -200,7 +200,11 @@ CREATE TABLE IF NOT EXISTS `assignment_rules` (
   `updated_at`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
                                         ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  -- Verhindert doppelte Einträge für identische Regeln (ermöglicht INSERT IGNORE)
+  -- Verhindert doppelte Einträge für identische Regeln (ermöglicht INSERT IGNORE).
+  -- Präfix-Länge (80) nötig, da InnoDB in utf8mb4 keinen vollständigen
+  -- VARCHAR(255)-Index in einem Composite-Key unterstützt (max. Zeilengröße).
+  -- 80 Zeichen reichen für alle eingebauten Regelwerte; eigene Regeln mit
+  -- längeren Werten werden anhand des vollständigen id-Felds unterschieden.
   UNIQUE KEY `uq_rule` (
     `rule_type`, `match_field`, `match_mode`,
     `match_value`(80), `assign_value`(80)
@@ -220,242 +224,229 @@ CREATE TABLE IF NOT EXISTS `assignment_rules` (
 -- Werden per INSERT IGNORE eingefügt – bestehende Anpassungen bleiben erhalten.
 -- Eigene Regeln einfach mit höherer priority (> 50) in die Tabelle eintragen.
 -- Regeln deaktivieren: UPDATE assignment_rules SET is_active=0 WHERE id=...;
+--
+-- DESIGN-ENTSCHEIDUNG: Keine firmenspezifischen Tag-Regeln.
+-- Tags werden primär durch die KI (topic_tags) bestimmt. Die Regeln hier
+-- ergänzen strukturell anhand von Dokumenttyp und Schlüsselwörtern.
+-- Die Tag-Hierarchie-Expansion (tag_hierarchy) ergänzt automatisch alle
+-- Vorfahren-Tags (z.B. Arztbrief → Gesundheit).
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
--- A) TAG-REGELN: Dokumenttyp → Tag  (priority 50, match: exact)
+-- A) TAG-REGELN: Dokumenttyp → Blatt-Tag  (priority 50, match: exact)
+-- Mappt den vom LLM bestimmten Dokumenttyp auf einen konkreten Blatt-Tag.
 -- ---------------------------------------------------------------------------
 INSERT IGNORE INTO `assignment_rules`
   (`rule_type`, `match_field`, `match_value`, `match_mode`, `assign_value`, `priority`, `description`)
 VALUES
+  ('tag','document_type','Rechnung',               'exact','Rechnung',               50,'Eingehende Rechnungen'),
+  ('tag','document_type','Kontoauszug',             'exact','Kontoauszug',             50,'Bankkontoauszüge'),
+  ('tag','document_type','Lohnabrechnung',          'exact','Lohnabrechnung',          50,'Lohnabrechnungen'),
+  ('tag','document_type','Gehaltsabrechnung',       'exact','Lohnabrechnung',          50,'Gehaltsabrechnungen'),
+  ('tag','document_type','Lohnsteuerbescheinigung', 'exact','Lohnsteuerbescheinigung', 50,'Lohnsteuerbescheinigungen'),
+  ('tag','document_type','Kreditvertrag',           'exact','Kredit',                  50,'Kreditverträge'),
+  ('tag','document_type','Darlehensvertrag',        'exact','Kredit',                  50,'Darlehensverträge'),
+  ('tag','document_type','Mahnung',                 'exact','Mahnung',                 50,'Mahnungen'),
+  ('tag','document_type','Mahnbescheid',            'exact','Mahnbescheid',            50,'Gerichtliche Mahnbescheide'),
+  ('tag','document_type','Quittung',                'exact','Quittung',                50,'Zahlungsquittungen'),
+  ('tag','document_type','Angebot',                 'exact','Angebot',                 50,'Kostenvoranschläge'),
+  ('tag','document_type','Steuerbescheid',          'exact','Steuerbescheid',          50,'Steuerbescheide'),
+  ('tag','document_type','Einkommensteuerbescheid', 'exact','Steuerbescheid',          50,'Einkommensteuerbescheide'),
+  ('tag','document_type','Einkommensteuererklärung','exact','Steuererklärung',         50,'Steuererklärungen'),
+  ('tag','document_type','Kirchensteuerbescheid',   'exact','Steuerbescheid',          50,'Kirchensteuerbescheide'),
+  ('tag','document_type','Umsatzsteuerbescheid',    'exact','Steuerbescheid',          50,'Umsatzsteuerbescheide'),
+  ('tag','document_type','Arztbrief',               'exact','Arztbrief',               50,'Arztbriefe'),
+  ('tag','document_type','Befundbericht',           'exact','Befund',                  50,'Befundberichte'),
+  ('tag','document_type','Krankenhausbericht',      'exact','Krankenhausbericht',      50,'Krankenhausberichte'),
+  ('tag','document_type','Entlassungsbrief',        'exact','Entlassungsbrief',        50,'Entlassungsbriefe'),
+  ('tag','document_type','Rezept',                  'exact','Rezept',                  50,'Arztrezepte'),
+  ('tag','document_type','Überweisungsschein',      'exact','Überweisung',             50,'Arztüberweisungen'),
+  ('tag','document_type','Krankenhausrechnung',     'exact','Rechnung',                50,'Krankenhausrechnungen'),
+  ('tag','document_type','Therapiebericht',         'exact','Therapiebericht',         50,'Therapieberichte'),
+  ('tag','document_type','Versicherungsschein',     'exact','Versicherungsschein',     50,'Versicherungsscheine'),
+  ('tag','document_type','Versicherungspolice',     'exact','Versicherungsschein',     50,'Versicherungspolicen'),
+  ('tag','document_type','Schadensregulierung',     'exact','Schadensregulierung',     50,'Schadensregulierungen'),
+  ('tag','document_type','Schadensmeldung',         'exact','Schadensmeldung',         50,'Schadensmeldungen'),
+  ('tag','document_type','Nachtragspolice',         'exact','Versicherungsschein',     50,'Nachtragspolicen'),
+  ('tag','document_type','Mietvertrag',             'exact','Mietvertrag',             50,'Mietverträge'),
+  ('tag','document_type','Nebenkostenabrechnung',   'exact','Nebenkostenabrechnung',   50,'Nebenkostenabrechnungen'),
+  ('tag','document_type','Mieterhöhung',            'exact','Mieterhöhung',            50,'Mieterhöhungsschreiben'),
+  ('tag','document_type','Kautionsquittung',        'exact','Kautionsquittung',        50,'Kautionsquittungen'),
+  ('tag','document_type','Wohnungskündigung',       'exact','Kündigung',               50,'Wohnungskündigungen'),
+  ('tag','document_type','Hausgeldabrechnung',      'exact','Hausgeldabrechnung',      50,'WEG-Hausgeldabrechnungen'),
+  ('tag','document_type','Arbeitsvertrag',          'exact','Arbeitsvertrag',          50,'Arbeitsverträge'),
+  ('tag','document_type','Zeugnis',                 'exact','Zeugnis',                 50,'Arbeitszeugnisse'),
+  ('tag','document_type','Kündigungsschreiben',     'exact','Kündigung',               50,'Kündigungen'),
+  ('tag','document_type','Abmahnung',               'exact','Abmahnung',               50,'Abmahnungen'),
+  ('tag','document_type','Bescheid',                'exact','Bescheid',                50,'Behördenbescheide'),
+  ('tag','document_type','Behördenpost',            'exact','Bescheid',                50,'Behördenpost'),
+  ('tag','document_type','Bußgeldbescheid',         'exact','Bußgeldbescheid',         50,'Bußgeldbescheide'),
+  ('tag','document_type','Gerichtsschreiben',       'exact','Gerichtsschreiben',       50,'Gerichtliche Korrespondenz'),
+  ('tag','document_type','Vollstreckungsbescheid',  'exact','Vollstreckung',           50,'Vollstreckungsbescheide'),
+  ('tag','document_type','Fahrzeugbrief',           'exact','Fahrzeugdokument',        50,'Fahrzeugbriefe'),
+  ('tag','document_type','Fahrzeugschein',          'exact','Fahrzeugdokument',        50,'Fahrzeugscheine'),
+  ('tag','document_type','HU-Bericht',              'exact','HU-TÜV',                  50,'Hauptuntersuchung'),
+  ('tag','document_type','Kfz-Steuer',              'exact','KFZ-Steuer',              50,'Kraftfahrzeugsteuer'),
+  ('tag','document_type','Mobilfunkvertrag',        'exact','Mobilfunk',               50,'Mobilfunkverträge'),
+  ('tag','document_type','Internetvertrag',         'exact','Internet',                50,'Internetverträge'),
+  ('tag','document_type','Vertrag',                 'exact','Vertrag',                 50,'Allgemeine Verträge'),
+  ('tag','document_type','Kündigung',               'exact','Kündigung',               50,'Allgemeine Kündigungen'),
+  ('tag','document_type','Bescheinigung',           'exact','Bescheinigung',           50,'Amtliche Bescheinigungen'),
+  ('tag','document_type','Werbung',                 'exact','Werbung',                 50,'Werbung');
+
+
+-- ---------------------------------------------------------------------------
+-- B) TAG-REGELN: Schlüsselwort im OCR-Text → Blatt-Tag  (priority 30)
+-- Semantisch, firmenunabhängig. Greift wenn der LLM-Typ nicht reicht.
+-- ---------------------------------------------------------------------------
+INSERT IGNORE INTO `assignment_rules`
+  (`rule_type`, `match_field`, `match_value`, `match_mode`, `assign_value`, `priority`, `description`)
+VALUES
+  ('tag','keyword','mahnung',             'contains','Mahnung',            30,'Mahnung via Volltext'),
+  ('tag','keyword','zahlungserinnerung',  'contains','Mahnung',            30,'Zahlungserinnerung'),
+  ('tag','keyword','inkasso',             'contains','Mahnung',            30,'Inkasso via Volltext'),
+  ('tag','keyword','vollstreckung',       'contains','Vollstreckung',      30,'Vollstreckung via Volltext'),
+  ('tag','keyword','zwangsvollstreckung', 'contains','Vollstreckung',      30,'Zwangsvollstreckung'),
+  ('tag','keyword','insolvenz',           'contains','Insolvenz',          30,'Insolvenz via Volltext'),
+  ('tag','keyword','kfz-steuer',          'contains','KFZ-Steuer',         30,'Kfz-Steuer via Volltext'),
+  ('tag','keyword','kraftfahrzeugsteuer', 'contains','KFZ-Steuer',         30,'Kraftfahrzeugsteuer'),
+  ('tag','keyword','hauptuntersuchung',   'contains','HU-TÜV',             30,'TÜV/HU via Volltext'),
+  ('tag','keyword','kindergeld',          'contains','Kindergeld',         30,'Kindergeld'),
+  ('tag','keyword','elterngeld',          'contains','Elterngeld',         30,'Elterngeld'),
+  ('tag','keyword','unterhalt',           'contains','Unterhalt',          30,'Unterhalt'),
+  ('tag','keyword','betreuungsgeld',      'contains','Elterngeld',         30,'Betreuungsgeld'),
+  ('tag','keyword','rentenbescheid',      'contains','Rentenbescheid',     30,'Rentenbescheid'),
+  ('tag','keyword','rentenanpassung',     'contains','Rentenbescheid',     30,'Rentenanpassung'),
+  ('tag','keyword','wohngeld',            'contains','Wohngeld',           30,'Wohngeld'),
+  ('tag','keyword','sozialhilfe',         'contains','Sozialhilfe',        30,'Sozialhilfe'),
+  ('tag','keyword','datenschutz',         'contains','Datenschutz',        30,'Datenschutz-Schreiben'),
+  ('tag','keyword','dsgvo',               'contains','Datenschutz',        30,'DSGVO'),
+  ('tag','keyword','abmahnung',           'contains','Abmahnung',          30,'Abmahnung erkannt'),
+  ('tag','keyword','krankenversicherung', 'contains','Krankenversicherung',30,'Krankenversicherung via Volltext'),
+  ('tag','keyword','pflegeversicherung',  'contains','Pflegeversicherung', 30,'Pflegeversicherung'),
+  ('tag','keyword','steuernummer',        'contains','Steuerbescheid',     30,'Steuernummer im Text'),
+  ('tag','keyword','finanzamt',           'contains','Steuerbescheid',     30,'Finanzamt via Volltext');
+
+
+-- =============================================================================
+-- TAG-HIERARCHIE
+-- Jeder Tag hat genau einen Eltern-Tag (Baumstruktur, keine Mehrfachzuordnung).
+-- Bei der Zuweisung werden alle Vorfahren automatisch mit hinzugefügt:
+--   Arztbrief → Gesundheit
+--   Krankenversicherung → Versicherung
+--   Mietvertrag → Vertrag
+--   Fahrzeugbrief → Fahrzeugdokument → KFZ
+-- Eigene Tags hinzufügen:
+--   INSERT IGNORE INTO tag_hierarchy (tag, parent_tag) VALUES ('Mein Tag','Finanzen');
+-- Hierarchie erweitern:
+--   INSERT IGNORE INTO tag_hierarchy (tag, parent_tag) VALUES ('Unterkat','Mein Tag');
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS `tag_hierarchy` (
+  `tag`        VARCHAR(100) NOT NULL COMMENT 'Blatt- oder Zwischen-Tag',
+  `parent_tag` VARCHAR(100) NULL     COMMENT 'NULL = Wurzel-Kategorie',
+  `sort_order` INT NOT NULL DEFAULT 0 COMMENT 'Sortierung innerhalb des Eltern-Knotens',
+  PRIMARY KEY (`tag`),
+  KEY `idx_parent` (`parent_tag`)
+) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_unicode_ci
+  COMMENT='Tag-Hierarchie: tag → parent_tag. Expansion erfolgt automatisch in logic_gate.';
+
+INSERT IGNORE INTO `tag_hierarchy` (`tag`, `parent_tag`, `sort_order`)
+VALUES
+  -- Wurzel-Kategorien (parent = NULL)
+  ('Finanzen',          NULL,          0),
+  ('Gesundheit',        NULL,          1),
+  ('Versicherung',      NULL,          2),
+  ('Vertrag',           NULL,          3),
+  ('Wohnen',            NULL,          4),
+  ('Arbeit',            NULL,          5),
+  ('Behörde',           NULL,          6),
+  ('Sozialleistungen',  NULL,          7),
+  ('Recht',             NULL,          8),
+  ('KFZ',               NULL,          9),
+  ('Telekommunikation', NULL,         10),
+  ('Familie',           NULL,         11),
+  ('Datenschutz',       NULL,         12),
   -- Finanzen
-  ('tag','document_type','Rechnung',              'exact','Rechnung',              50,'Eingehende Rechnungen'),
-  ('tag','document_type','Kontoauszug',            'exact','Kontoauszug',            50,'Bankkontoauszüge'),
-  ('tag','document_type','Lohnabrechnung',         'exact','Gehalt',                 50,'Gehalts-/Lohnabrechnungen'),
-  ('tag','document_type','Gehaltsabrechnung',      'exact','Gehalt',                 50,'Gehalts-/Lohnabrechnungen'),
-  ('tag','document_type','Lohnsteuerbescheinigung','exact','Steuern',                50,'Lohnsteuerbescheinigungen'),
-  ('tag','document_type','Kreditvertrag',          'exact','Kredit',                 50,'Kredite und Darlehen'),
-  ('tag','document_type','Darlehensvertrag',       'exact','Kredit',                 50,'Darlehensverträge'),
-  ('tag','document_type','Mahnung',                'exact','Mahnung',                50,'Zahlungsmahnung'),
-  ('tag','document_type','Mahnbescheid',           'exact','Mahnung',                50,'Gerichtlicher Mahnbescheid'),
-  ('tag','document_type','Quittung',               'exact','Quittung',               50,'Zahlungsquittungen'),
-  ('tag','document_type','Angebot',                'exact','Angebot',                50,'Kostenvoranschläge und Angebote'),
-  -- Steuern
-  ('tag','document_type','Steuerbescheid',             'exact','Steuern', 50,'Steuerbescheide allgemein'),
-  ('tag','document_type','Einkommensteuerbescheid',    'exact','Steuern', 50,'Einkommensteuerbescheide'),
-  ('tag','document_type','Einkommensteuererklärung',   'exact','Steuern', 50,'Steuererklärungen'),
-  ('tag','document_type','Kirchensteuerbescheid',      'exact','Steuern', 50,'Kirchensteuerbescheide'),
-  ('tag','document_type','Umsatzsteuerbescheid',       'exact','Steuern', 50,'Umsatzsteuerbescheide'),
+  ('Rechnung',                'Finanzen',    0),
+  ('Kontoauszug',             'Finanzen',    1),
+  ('Kredit',                  'Finanzen',    2),
+  ('Steuern',                 'Finanzen',    3),
+  ('Gehalt',                  'Finanzen',    4),
+  ('Lohnabrechnung',          'Gehalt',      0),
+  ('Lohnsteuerbescheinigung', 'Steuern',     0),
+  ('Steuerbescheid',          'Steuern',     1),
+  ('Steuererklärung',         'Steuern',     2),
+  ('Mahnung',                 'Finanzen',    5),
+  ('Vollstreckung',           'Recht',       0),
+  ('Insolvenz',               'Recht',       1),
+  ('Mahnbescheid',            'Recht',       2),
+  ('Quittung',                'Finanzen',    6),
+  ('Angebot',                 'Finanzen',    7),
   -- Gesundheit
-  ('tag','document_type','Arztbrief',          'exact','Gesundheit', 50,'Arztbriefe'),
-  ('tag','document_type','Befundbericht',      'exact','Gesundheit', 50,'Medizinische Befundberichte'),
-  ('tag','document_type','Krankenhausbericht', 'exact','Gesundheit', 50,'Krankenhausberichte'),
-  ('tag','document_type','Entlassungsbrief',   'exact','Gesundheit', 50,'Entlassungsbriefe aus Krankenhaus'),
-  ('tag','document_type','Rezept',             'exact','Gesundheit', 50,'Arztrezepte'),
-  ('tag','document_type','Überweisungsschein', 'exact','Gesundheit', 50,'Facharzt-Überweisungen'),
-  ('tag','document_type','Krankenhausrechnung','exact','Gesundheit', 50,'Krankenhausrechnungen'),
-  ('tag','document_type','Therapiebericht',    'exact','Gesundheit', 50,'Therapieberichte'),
-  -- Versicherungen
-  ('tag','document_type','Versicherungsschein',  'exact','Versicherung', 50,'Versicherungsscheine'),
-  ('tag','document_type','Versicherungspolice',  'exact','Versicherung', 50,'Versicherungspolicen'),
-  ('tag','document_type','Schadensregulierung',  'exact','Versicherung', 50,'Schadensregulierungen'),
-  ('tag','document_type','Schadensmeldung',      'exact','Versicherung', 50,'Schadensmeldungen'),
-  ('tag','document_type','Nachtragspolice',      'exact','Versicherung', 50,'Nachtragspolicen'),
-  -- Wohnen / Immobilien
-  ('tag','document_type','Mietvertrag',            'exact','Wohnen', 50,'Mietverträge'),
-  ('tag','document_type','Nebenkostenabrechnung',  'exact','Wohnen', 50,'Nebenkostenabrechnungen'),
-  ('tag','document_type','Mieterhöhung',           'exact','Wohnen', 50,'Mieterhöhungsschreiben'),
-  ('tag','document_type','Kautionsquittung',       'exact','Wohnen', 50,'Kautionsquittungen'),
-  ('tag','document_type','Wohnungskündigung',      'exact','Wohnen', 50,'Wohnungskündigungen'),
-  ('tag','document_type','Hausgeldabrechnung',     'exact','Wohnen', 50,'WEG-Hausgeldabrechnungen'),
-  -- Arbeit / Beruf
-  ('tag','document_type','Arbeitsvertrag',     'exact','Arbeit', 50,'Arbeitsverträge'),
-  ('tag','document_type','Zeugnis',            'exact','Arbeit', 50,'Arbeitszeugnisse'),
-  ('tag','document_type','Kündigungsschreiben','exact','Kündigung', 50,'Arbeitgeberkündigungen'),
-  ('tag','document_type','Abmahnung',          'exact','Arbeit', 50,'Arbeitsrechtliche Abmahnungen'),
-  -- Behörden / Recht
-  ('tag','document_type','Bescheid',               'exact','Behörde',      50,'Behördenbescheide allgemein'),
-  ('tag','document_type','Behördenpost',           'exact','Behörde',      50,'Post von Behörden'),
-  ('tag','document_type','Bußgeldbescheid',        'exact','Bußgeld',      50,'Bußgeldbescheide'),
-  ('tag','document_type','Gerichtsschreiben',      'exact','Recht',        50,'Gerichtliche Korrespondenz'),
-  ('tag','document_type','Vollstreckungsbescheid', 'exact','Vollstreckung',50,'Vollstreckungsbescheide'),
-  ('tag','document_type','Mahnbescheid',           'exact','Mahnung',      50,'Gerichtliche Mahnbescheide'),
-  -- KFZ / Fahrzeuge
-  ('tag','document_type','Fahrzeugbrief',   'exact','KFZ', 50,'Fahrzeugbriefe / Zulassungsbescheinigungen'),
-  ('tag','document_type','Fahrzeugschein',  'exact','KFZ', 50,'Fahrzeugscheine'),
-  ('tag','document_type','HU-Bericht',      'exact','KFZ', 50,'Hauptuntersuchung (TÜV)'),
-  ('tag','document_type','Kfz-Steuer',      'exact','KFZ', 50,'Kraftfahrzeugsteuerbescheide'),
-  -- Telekommunikation / Internet
-  ('tag','document_type','Mobilfunkvertrag', 'exact','Telekommunikation', 50,'Mobilfunkverträge'),
-  ('tag','document_type','Internetvertrag',  'exact','Telekommunikation', 50,'Internetverträge'),
-  -- Sonstiges
-  ('tag','document_type','Vertrag',       'exact','Vertrag',      50,'Allgemeine Verträge'),
-  ('tag','document_type','Kündigung',     'exact','Kündigung',    50,'Allgemeine Kündigungen'),
-  ('tag','document_type','Bescheinigung', 'exact','Bescheinigung',50,'Amtliche Bescheinigungen'),
-  ('tag','document_type','Werbung',       'exact','Werbung',      50,'Werbung und Marketing');
-
-
--- ---------------------------------------------------------------------------
--- B) TAG-REGELN: Organisation → Tag  (priority 40, match: contains)
--- ---------------------------------------------------------------------------
-INSERT IGNORE INTO `assignment_rules`
-  (`rule_type`, `match_field`, `match_value`, `match_mode`, `assign_value`, `priority`, `description`)
-VALUES
-  -- Gesetzliche Krankenversicherungen
-  ('tag','organization','Techniker Krankenkasse', 'contains','Krankenversicherung', 40,'TK → Krankenversicherung'),
-  ('tag','organization','Barmer',                 'contains','Krankenversicherung', 40,'Barmer → Krankenversicherung'),
-  ('tag','organization','AOK',                    'contains','Krankenversicherung', 40,'AOK → Krankenversicherung'),
-  ('tag','organization','DAK',                    'contains','Krankenversicherung', 40,'DAK → Krankenversicherung'),
-  ('tag','organization','IKK',                    'contains','Krankenversicherung', 40,'IKK → Krankenversicherung'),
-  ('tag','organization','Knappschaft',            'contains','Krankenversicherung', 40,'Knappschaft → Krankenversicherung'),
-  ('tag','organization','BKK',                    'contains','Krankenversicherung', 40,'BKK → Krankenversicherung'),
-  ('tag','organization','Hanseatische Krankenkasse','contains','Krankenversicherung',40,'HEK → Krankenversicherung'),
-  ('tag','organization','hkk',                    'contains','Krankenversicherung', 40,'hkk → Krankenversicherung'),
-  -- Deutsche Rentenversicherung
-  ('tag','organization','Deutsche Rentenversicherung','contains','Rente', 40,'DRV → Rente'),
-  ('tag','organization','Rentenversicherung',          'contains','Rente', 40,'Rentenversicherung → Rente'),
-  -- Bundesagentur für Arbeit / Jobcenter
-  ('tag','organization','Bundesagentur für Arbeit','contains','Arbeitsagentur', 40,'BA für Arbeit'),
-  ('tag','organization','Jobcenter',               'contains','Jobcenter',      40,'Jobcenter → Sozialleistungen'),
-  -- Finanzamt / Steuerbehörden
-  ('tag','organization','Finanzamt',               'contains','Steuern', 40,'Finanzamt → Steuern'),
-  ('tag','organization','Bundeszentralamt',        'contains','Steuern', 40,'Bundeszentralamt für Steuern'),
-  -- Gerichte / Recht
-  ('tag','organization','Amtsgericht',             'contains','Recht', 40,'Amtsgericht → Recht'),
-  ('tag','organization','Landgericht',             'contains','Recht', 40,'Landgericht → Recht'),
-  ('tag','organization','Oberlandesgericht',       'contains','Recht', 40,'OLG → Recht'),
-  ('tag','organization','Bundesgericht',           'contains','Recht', 40,'Bundesgericht → Recht'),
-  ('tag','organization','Rechtsanwalt',            'contains','Recht', 40,'Anwaltskanzlei → Recht'),
-  ('tag','organization','Inkasso',                 'contains','Mahnung', 40,'Inkasso-Büro → Mahnung'),
-  -- Sonstige Behörden
-  ('tag','organization','Ordnungsamt',             'contains','Behörde', 40,'Ordnungsamt → Behörde'),
-  ('tag','organization','Bürgeramt',               'contains','Behörde', 40,'Bürgeramt → Behörde'),
-  ('tag','organization','Einwohnermeldeamt',       'contains','Behörde', 40,'Einwohnermeldeamt → Behörde'),
-  ('tag','organization','Jugendamt',               'contains','Behörde', 40,'Jugendamt → Behörde'),
-  ('tag','organization','Sozialamt',               'contains','Behörde', 40,'Sozialamt → Sozialleistungen'),
-  ('tag','organization','Versorgungsamt',          'contains','Behörde', 40,'Versorgungsamt → Behörde'),
-  ('tag','organization','Zoll',                    'contains','Behörde', 40,'Zollbehörde → Behörde'),
-  -- Energie / Versorger
-  ('tag','organization','Stadtwerke', 'contains','Energie', 40,'Stadtwerke → Energie'),
-  ('tag','organization','E.ON',       'contains','Energie', 40,'E.ON → Energie'),
-  ('tag','organization','RWE',        'contains','Energie', 40,'RWE → Energie'),
-  ('tag','organization','EnBW',       'contains','Energie', 40,'EnBW → Energie'),
-  ('tag','organization','Vattenfall', 'contains','Energie', 40,'Vattenfall → Energie'),
-  ('tag','organization','Innogy',     'contains','Energie', 40,'Innogy → Energie'),
-  ('tag','organization','Eon',        'contains','Energie', 40,'Eon → Energie'),
+  ('Arztbrief',          'Gesundheit',   0),
+  ('Befund',             'Gesundheit',   1),
+  ('Rezept',             'Gesundheit',   2),
+  ('Überweisung',        'Gesundheit',   3),
+  ('Therapiebericht',    'Gesundheit',   4),
+  ('Krankenhaus',        'Gesundheit',   5),
+  ('Krankenhausbericht', 'Krankenhaus',  0),
+  ('Entlassungsbrief',   'Krankenhaus',  1),
+  -- Versicherung
+  ('Krankenversicherung',             'Versicherung',        0),
+  ('Gesetzliche Krankenversicherung', 'Krankenversicherung', 0),
+  ('Private Krankenversicherung',     'Krankenversicherung', 1),
+  ('Pflegeversicherung',              'Versicherung',        1),
+  ('KFZ-Versicherung',                'Versicherung',        2),
+  ('Haftpflicht',                     'Versicherung',        3),
+  ('Lebensversicherung',              'Versicherung',        4),
+  ('Hausratversicherung',             'Versicherung',        5),
+  ('Rentenversicherung',              'Versicherung',        6),
+  ('Versicherungsschein',             'Versicherung',        7),
+  ('Schadensmeldung',                 'Versicherung',        8),
+  ('Schadensregulierung',             'Versicherung',        9),
+  -- Vertrag
+  ('Mietvertrag',      'Vertrag', 0),
+  ('Arbeitsvertrag',   'Vertrag', 1),
+  ('Mobilfunkvertrag', 'Vertrag', 2),
+  ('Internetvertrag',  'Vertrag', 3),
+  -- Wohnen
+  ('Nebenkostenabrechnung', 'Wohnen', 0),
+  ('Mieterhöhung',          'Wohnen', 1),
+  ('Kautionsquittung',      'Wohnen', 2),
+  ('Hausgeldabrechnung',    'Wohnen', 3),
+  -- Arbeit
+  ('Zeugnis',   'Arbeit', 0),
+  ('Abmahnung', 'Arbeit', 1),
+  -- Behörde
+  ('Bescheid',        'Behörde', 0),
+  ('Bußgeldbescheid', 'Behörde', 1),
+  ('Bescheinigung',   'Behörde', 2),
+  ('Rentenbescheid',  'Behörde', 3),
+  -- Sozialleistungen
+  ('Kindergeld',  'Sozialleistungen', 0),
+  ('Elterngeld',  'Sozialleistungen', 1),
+  ('Wohngeld',    'Sozialleistungen', 2),
+  ('Sozialhilfe', 'Sozialleistungen', 3),
+  ('Unterhalt',   'Sozialleistungen', 4),
+  -- Recht
+  ('Gerichtsschreiben', 'Recht', 3),
+  ('Kündigung',         'Recht', 4),
+  -- KFZ
+  ('Fahrzeugdokument', 'KFZ',              0),
+  ('Fahrzeugbrief',    'Fahrzeugdokument',  0),
+  ('Fahrzeugschein',   'Fahrzeugdokument',  1),
+  ('KFZ-Steuer',       'KFZ',              1),
+  ('HU-TÜV',           'KFZ',              2),
   -- Telekommunikation
-  ('tag','organization','Telekom',  'contains','Telekommunikation', 40,'Telekom → Telekommunikation'),
-  ('tag','organization','Vodafone', 'contains','Telekommunikation', 40,'Vodafone → Telekommunikation'),
-  ('tag','organization','O2',       'contains','Telekommunikation', 40,'O2 → Telekommunikation'),
-  ('tag','organization','1&1',      'contains','Telekommunikation', 40,'1&1 → Telekommunikation'),
-  ('tag','organization','Freenet',  'contains','Telekommunikation', 40,'Freenet → Telekommunikation'),
-  ('tag','organization','Unitymedia','contains','Telekommunikation',40,'Unitymedia → Telekommunikation'),
-  ('tag','organization','Congstar', 'contains','Telekommunikation', 40,'Congstar → Telekommunikation'),
-  -- Banken
-  ('tag','organization','Sparkasse',     'contains','Bank', 40,'Sparkasse → Bank'),
-  ('tag','organization','Volksbank',     'contains','Bank', 40,'Volksbank → Bank'),
-  ('tag','organization','Raiffeisenbank','contains','Bank', 40,'Raiffeisenbank → Bank'),
-  ('tag','organization','Commerzbank',   'contains','Bank', 40,'Commerzbank → Bank'),
-  ('tag','organization','Deutsche Bank', 'contains','Bank', 40,'Deutsche Bank → Bank'),
-  ('tag','organization','DKB',           'contains','Bank', 40,'DKB → Bank'),
-  ('tag','organization','ING',           'contains','Bank', 40,'ING → Bank'),
-  ('tag','organization','Postbank',      'contains','Bank', 40,'Postbank → Bank'),
-  ('tag','organization','Comdirect',     'contains','Bank', 40,'Comdirect → Bank'),
-  ('tag','organization','N26',           'contains','Bank', 40,'N26 → Bank'),
-  ('tag','organization','Targobank',     'contains','Bank', 40,'Targobank → Bank'),
-  -- Versicherungen
-  ('tag','organization','Allianz',   'contains','Versicherung', 40,'Allianz → Versicherung'),
-  ('tag','organization','HUK',       'contains','Versicherung', 40,'HUK → Versicherung'),
-  ('tag','organization','AXA',       'contains','Versicherung', 40,'AXA → Versicherung'),
-  ('tag','organization','Generali',  'contains','Versicherung', 40,'Generali → Versicherung'),
-  ('tag','organization','Zurich',    'contains','Versicherung', 40,'Zurich → Versicherung'),
-  ('tag','organization','R+V',       'contains','Versicherung', 40,'R+V → Versicherung'),
-  ('tag','organization','DEVK',      'contains','Versicherung', 40,'DEVK → Versicherung'),
-  ('tag','organization','Ergo',      'contains','Versicherung', 40,'Ergo → Versicherung'),
-  ('tag','organization','Debeka',    'contains','Versicherung', 40,'Debeka → Versicherung'),
-  ('tag','organization','Signal Iduna','contains','Versicherung',40,'Signal Iduna → Versicherung'),
-  ('tag','organization','VHV',       'contains','Versicherung', 40,'VHV → Versicherung'),
-  ('tag','organization','Gothaer',   'contains','Versicherung', 40,'Gothaer → Versicherung'),
-  -- Rundfunkbeitrag
-  ('tag','organization','Beitragsservice','contains','Rundfunkbeitrag', 40,'ARD ZDF GEZ → Rundfunkbeitrag'),
-  ('tag','organization','GEZ',            'contains','Rundfunkbeitrag', 40,'GEZ → Rundfunkbeitrag');
-
-
--- ---------------------------------------------------------------------------
--- C) TAG-REGELN: Schlüsselwort im OCR-Text → Tag  (priority 30, contains)
--- Greifen wenn Dokumenttyp/Organisation nichts passendes liefert.
--- ---------------------------------------------------------------------------
-INSERT IGNORE INTO `assignment_rules`
-  (`rule_type`, `match_field`, `match_value`, `match_mode`, `assign_value`, `priority`, `description`)
-VALUES
-  ('tag','keyword','mahnung',            'contains','Mahnung',           30,'Mahnungserkennung via Volltext'),
-  ('tag','keyword','zahlungserinnerung', 'contains','Mahnung',           30,'Zahlungserinnerung via Volltext'),
-  ('tag','keyword','inkasso',            'contains','Mahnung',           30,'Inkasso-Schreiben via Volltext'),
-  ('tag','keyword','vollstreckung',      'contains','Vollstreckung',     30,'Vollstreckungsmaßnahme via Volltext'),
-  ('tag','keyword','zwangsvollstreckung','contains','Vollstreckung',     30,'Zwangsvollstreckung via Volltext'),
-  ('tag','keyword','insolvenz',          'contains','Insolvenz',         30,'Insolvenz-Schreiben via Volltext'),
-  ('tag','keyword','kfz-steuer',         'contains','KFZ',               30,'Kfz-Steuer → KFZ via Volltext'),
-  ('tag','keyword','kraftfahrzeugsteuer','contains','KFZ',               30,'Kraftfahrzeugsteuer → KFZ'),
-  ('tag','keyword','fahrzeugschein',     'contains','KFZ',               30,'Fahrzeugschein → KFZ'),
-  ('tag','keyword','hauptuntersuchung',  'contains','KFZ',               30,'TÜV/HU → KFZ'),
-  ('tag','keyword','kindergeld',         'contains','Familie',           30,'Kindergeld → Familie'),
-  ('tag','keyword','elterngeld',         'contains','Familie',           30,'Elterngeld → Familie'),
-  ('tag','keyword','unterhalt',          'contains','Familie',           30,'Unterhalt → Familie'),
-  ('tag','keyword','betreuungsgeld',     'contains','Familie',           30,'Betreuungsgeld → Familie'),
-  ('tag','keyword','rentenbescheid',     'contains','Rente',             30,'Rentenbescheid → Rente'),
-  ('tag','keyword','rentenanpassung',    'contains','Rente',             30,'Rentenanpassung → Rente'),
-  ('tag','keyword','wohngeld',           'contains','Sozialleistungen',  30,'Wohngeld → Sozialleistungen'),
-  ('tag','keyword','sozialhilfe',        'contains','Sozialleistungen',  30,'Sozialhilfe → Sozialleistungen'),
-  ('tag','keyword','datenschutz',        'contains','Datenschutz',       30,'Datenschutz-bezogen'),
-  ('tag','keyword','dsgvo',              'contains','Datenschutz',       30,'DSGVO-Schreiben'),
-  ('tag','keyword','abmahnung',          'contains','Abmahnung',         30,'Abmahnung erkannt (Arbeit oder Recht)'),
-  ('tag','keyword','beitragsrechnung',   'contains','Versicherung',      30,'Versicherungsbeitragsrechnung'),
-  ('tag','keyword','krankenversicherung','contains','Krankenversicherung',30,'Krankenversicherung via Volltext'),
-  ('tag','keyword','pflegeversicherung', 'contains','Pflegeversicherung',30,'Pflegeversicherung via Volltext'),
-  ('tag','keyword','steuernummer',       'contains','Steuern',           30,'Steuernummer → Steuer-Dokument'),
-  ('tag','keyword','steuer-id',          'contains','Steuern',           30,'Steuer-ID → Steuer-Dokument'),
-  ('tag','keyword','finanzamt',          'contains','Steuern',           30,'Finanzamt via Volltext');
-
-
--- ---------------------------------------------------------------------------
--- D) KORRESPONDENTEN-REGELN: Absender-Normalisierung  (priority 20, contains)
--- Sorgt für einheitliche Korrespondentennamen in Paperless unabhängig
--- von der genauen Absenderangabe im Dokument.
--- ---------------------------------------------------------------------------
-INSERT IGNORE INTO `assignment_rules`
-  (`rule_type`, `match_field`, `match_value`, `match_mode`, `assign_value`, `priority`, `description`)
-VALUES
-  ('correspondent','sender','Techniker Krankenkasse',    'contains','Techniker Krankenkasse',    20,'TK-Varianten normieren'),
-  ('correspondent','sender','Barmer',                    'contains','Barmer',                    20,'Barmer normieren'),
-  ('correspondent','sender','AOK',                       'contains','AOK',                       20,'AOK normieren'),
-  ('correspondent','sender','DAK',                       'contains','DAK-Gesundheit',             20,'DAK normieren'),
-  ('correspondent','sender','IKK',                       'contains','IKK',                       20,'IKK normieren'),
-  ('correspondent','sender','Deutsche Rentenversicherung','contains','Deutsche Rentenversicherung',20,'DRV normieren'),
-  ('correspondent','sender','Bundesagentur für Arbeit',  'contains','Bundesagentur für Arbeit',  20,'BA für Arbeit normieren'),
-  ('correspondent','sender','Jobcenter',                 'contains','Jobcenter',                 20,'Jobcenter normieren'),
-  ('correspondent','sender','Finanzamt',                 'contains','Finanzamt',                 20,'Finanzamt normieren'),
-  ('correspondent','sender','Amtsgericht',               'contains','Amtsgericht',               20,'Amtsgericht normieren'),
-  ('correspondent','sender','Landgericht',               'contains','Landgericht',               20,'Landgericht normieren'),
-  ('correspondent','sender','Allianz',                   'contains','Allianz',                   20,'Allianz normieren'),
-  ('correspondent','sender','HUK',                       'contains','HUK-COBURG',                20,'HUK-Varianten normieren'),
-  ('correspondent','sender','AXA',                       'contains','AXA',                       20,'AXA normieren'),
-  ('correspondent','sender','DEVK',                      'contains','DEVK',                      20,'DEVK normieren'),
-  ('correspondent','sender','Ergo',                      'contains','Ergo',                      20,'Ergo normieren'),
-  ('correspondent','sender','Debeka',                    'contains','Debeka',                    20,'Debeka normieren'),
-  ('correspondent','sender','Signal Iduna',              'contains','Signal Iduna',               20,'Signal Iduna normieren'),
-  ('correspondent','sender','Stadtwerke',                'contains','Stadtwerke',                20,'Stadtwerke (lokal) normieren'),
-  ('correspondent','sender','Telekom',                   'contains','Deutsche Telekom',           20,'Telekom normieren'),
-  ('correspondent','sender','Vodafone',                  'contains','Vodafone',                  20,'Vodafone normieren'),
-  ('correspondent','sender','1&1',                       'contains','1&1',                       20,'1&1 normieren'),
-  ('correspondent','sender','Sparkasse',                 'contains','Sparkasse',                 20,'Sparkasse normieren'),
-  ('correspondent','sender','Volksbank',                 'contains','Volksbank',                 20,'Volksbank normieren'),
-  ('correspondent','sender','Commerzbank',               'contains','Commerzbank',               20,'Commerzbank normieren'),
-  ('correspondent','sender','Deutsche Bank',             'contains','Deutsche Bank',             20,'Deutsche Bank normieren'),
-  ('correspondent','sender','DKB',                       'contains','DKB Deutsche Kreditbank',   20,'DKB normieren'),
-  ('correspondent','sender','ING',                       'contains','ING',                       20,'ING normieren'),
-  ('correspondent','sender','Postbank',                  'contains','Postbank',                  20,'Postbank normieren'),
-  ('correspondent','sender','Beitragsservice',           'contains','ARD ZDF Beitragsservice',   20,'GEZ/Beitragsservice normieren');
-
+  ('Mobilfunk', 'Telekommunikation', 0),
+  ('Internet',  'Telekommunikation', 1),
+  -- Familie
+  ('Betreuung', 'Familie', 0),
+  -- Datenschutz
+  ('DSGVO', 'Datenschutz', 0);
 
 
 CREATE OR REPLACE VIEW `v_document_overview` AS

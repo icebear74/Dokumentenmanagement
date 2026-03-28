@@ -18,7 +18,7 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -54,6 +54,94 @@ def _get_prompt_template() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Datumsnormalisierung
+# ---------------------------------------------------------------------------
+
+_GERMAN_MONTHS = {
+    "januar": 1, "februar": 2, "märz": 3, "april": 4,
+    "mai": 5, "juni": 6, "juli": 7, "august": 8,
+    "september": 9, "oktober": 10, "november": 11, "dezember": 12,
+    # Kurzformen
+    "jan": 1, "feb": 2, "mär": 3, "apr": 4,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dez": 12,
+}
+
+def normalize_date(raw: str | None) -> str | None:
+    """Normalisiert Datumsangaben aus LLM-Output oder OCR auf YYYY-MM-DD.
+
+    Akzeptiert u.a.:
+      • "27. März 2026" / "27.März 2026"
+      • "27.03.2026" / "27.3.2026"
+      • "2026-03-27"  (bereits ISO)
+      • "März 2026"   → "2026-03-01"
+      • "03/2026"     → "2026-03-01"
+      • "2026"        → "2026-01-01"
+
+    Returns:
+        ISO-Datumsstring (YYYY-MM-DD) oder None wenn nicht erkennbar.
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+
+    # Bereits ISO YYYY-MM-DD
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            pass
+
+    # DD.MM.YYYY oder DD.M.YYYY
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+        except ValueError:
+            pass
+
+    # DD. Monatsname YYYY oder DD.Monatsname YYYY
+    m = re.match(r"(\d{1,2})\.?\s+([A-Za-zäöüÄÖÜ]+)\s+(\d{4})", s)
+    if m:
+        month_name = m.group(2).lower()
+        month_num = _GERMAN_MONTHS.get(month_name)
+        if month_num:
+            try:
+                return date(int(m.group(3)), month_num, int(m.group(1))).isoformat()
+            except ValueError:
+                pass
+
+    # Monatsname YYYY  (kein Tag → 1. des Monats)
+    m = re.match(r"([A-Za-zäöüÄÖÜ]+)\s+(\d{4})", s)
+    if m:
+        month_name = m.group(1).lower()
+        month_num = _GERMAN_MONTHS.get(month_name)
+        if month_num:
+            try:
+                return date(int(m.group(2)), month_num, 1).isoformat()
+            except ValueError:
+                pass
+
+    # MM/YYYY oder MM.YYYY
+    m = re.fullmatch(r"(\d{1,2})[./](\d{4})", s)
+    if m:
+        try:
+            return date(int(m.group(2)), int(m.group(1)), 1).isoformat()
+        except ValueError:
+            pass
+
+    # Nur Jahr
+    m = re.fullmatch(r"(\d{4})", s)
+    if m:
+        year = int(m.group(1))
+        if 1900 <= year <= 2100:
+            return f"{year}-01-01"
+
+    logger.debug("Datum konnte nicht normalisiert werden: %r", raw)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Hilfsklassen
 # ---------------------------------------------------------------------------
 
@@ -66,15 +154,19 @@ class AnalysisResult:
         reference_number: str | None,
         confidence: float,
         recipient_names: list[str],
+        topic_tags: list[str],
+        organizations: list[str],
         ocr_text: str,
         raw_json: dict,
     ) -> None:
         self.sender = sender
-        self.document_date = document_date
+        self.document_date = document_date      # ISO YYYY-MM-DD or None
         self.document_type = document_type
         self.reference_number = reference_number
         self.confidence = confidence
         self.recipient_names = recipient_names
+        self.topic_tags = topic_tags            # LLM-extracted semantic tags
+        self.organizations = organizations      # named orgs from document
         self.ocr_text = ocr_text
         self.raw_json = raw_json
 
@@ -169,11 +261,19 @@ def analyze_document(pdf_path: Path, config: AppConfig) -> AnalysisResult:
 
     return AnalysisResult(
         sender=raw_json.get("sender"),
-        document_date=raw_json.get("document_date"),
+        document_date=normalize_date(raw_json.get("document_date")),
         document_type=raw_json.get("document_type", "Sonstiges"),
         reference_number=raw_json.get("reference_number"),
         confidence=float(raw_json.get("confidence", 0.0)),
-        recipient_names=raw_json.get("recipient_names", []),
+        recipient_names=[
+            str(n) for n in raw_json.get("recipient_names", []) if n
+        ],
+        topic_tags=[
+            str(t).strip() for t in raw_json.get("topic_tags", []) if t
+        ],
+        organizations=[
+            str(o) for o in raw_json.get("organizations", []) if o
+        ],
         ocr_text=ocr_text,
         raw_json=raw_json,
     )
@@ -293,11 +393,13 @@ def _build_sidecar(
         "analyzed_at": datetime.utcnow().isoformat(),
         "status": status,
         "sender": result.sender,
-        "document_date": result.document_date,
+        "document_date": result.document_date,   # ISO YYYY-MM-DD or null
         "document_type": result.document_type,
         "reference_number": result.reference_number,
         "confidence": result.confidence,
         "recipient_names": result.recipient_names,
+        "topic_tags": result.topic_tags,          # LLM-extracted semantic tags
+        "organizations": result.organizations,    # named orgs from document
         "raw": result.raw_json,
     }
 

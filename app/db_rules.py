@@ -84,6 +84,8 @@ class RulesCache:
         self._lock = threading.Lock()
         self._rules: list[AssignmentRule] = []
         self._prompts: dict[tuple[str, str, str], str] = {}
+        # tag → parent_tag (None = root).  Loaded from tag_hierarchy table.
+        self._hierarchy: dict[str, str | None] = {}
         self._loaded_at: float = 0.0
 
     # ------------------------------------------------------------------
@@ -97,6 +99,12 @@ class RulesCache:
             if rule_type:
                 return [r for r in self._rules if r.rule_type == rule_type]
             return list(self._rules)
+
+    def get_hierarchy(self) -> dict[str, str | None]:
+        """Gibt die Tag-Hierarchie zurück: {tag → parent_tag | None}."""
+        self._refresh_if_stale()
+        with self._lock:
+            return dict(self._hierarchy)
 
     def get_prompt(
         self,
@@ -145,6 +153,7 @@ class RulesCache:
     def _load_from_db(self, conn: mysql.connector.MySQLConnection) -> None:
         rules: list[AssignmentRule] = []
         prompts: dict[tuple[str, str, str], str] = {}
+        hierarchy: dict[str, str | None] = {}
 
         cursor = conn.cursor(dictionary=True)
 
@@ -184,17 +193,35 @@ class RulesCache:
             key = (str(row["service"]), str(row["name"]), str(row["prompt_type"]))
             prompts[key] = str(row["content"])
 
+        # Tag-Hierarchie laden (optional – Tabelle muss existieren)
+        try:
+            cursor.execute(
+                "SELECT tag, parent_tag FROM tag_hierarchy ORDER BY sort_order ASC"
+            )
+            for row in cursor.fetchall():
+                hierarchy[str(row["tag"])] = (
+                    str(row["parent_tag"]) if row["parent_tag"] else None
+                )
+        except Exception as exc:
+            logger.warning(
+                "tag_hierarchy konnte nicht geladen werden: %s. "
+                "Hierarchie-Expansion deaktiviert.",
+                exc,
+            )
+
         cursor.close()
 
         with self._lock:
             self._rules = rules
             self._prompts = prompts
+            self._hierarchy = hierarchy
             self._loaded_at = time.time()
 
         logger.debug(
-            "DB-Cache aktualisiert: %d Regeln, %d Prompts",
+            "DB-Cache aktualisiert: %d Regeln, %d Prompts, %d Hierarchie-Einträge",
             len(rules),
             len(prompts),
+            len(hierarchy),
         )
 
 
@@ -310,238 +337,362 @@ def _matches(target: str, pattern: str, mode: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Eingebaute Standard-Regeln (identisch mit den INSERT IGNORE-Blöcken in
-# database.sql – hier als Python-Konstante für ensure_defaults())
+# Eingebaute Standard-Regeln – nur SEMANTISCH, KEINE firmenbezogenen Regeln.
+# Tags kommen primär vom LLM (topic_tags). Diese Regeln ergänzen strukturell.
 # Format: (rule_type, match_field, match_value, match_mode, assign_value,
 #           priority, description)
 # ---------------------------------------------------------------------------
 _BUILTIN_RULES: list[tuple[str, str, str, str, str, int, str]] = [
-    # ── A) Dokumenttyp → Tag ────────────────────────────────────────────────
+    # ── A) Dokumenttyp → Blatt-Tag  (LLM gibt Dokumenttyp, Regel mappt auf Tag)
     # Finanzen
-    ("tag","document_type","Rechnung",              "exact","Rechnung",              50,"Eingehende Rechnungen"),
-    ("tag","document_type","Kontoauszug",            "exact","Kontoauszug",            50,"Bankkontoauszüge"),
-    ("tag","document_type","Lohnabrechnung",         "exact","Gehalt",                 50,"Gehalts-/Lohnabrechnungen"),
-    ("tag","document_type","Gehaltsabrechnung",      "exact","Gehalt",                 50,"Gehalts-/Lohnabrechnungen"),
-    ("tag","document_type","Lohnsteuerbescheinigung","exact","Steuern",                50,"Lohnsteuerbescheinigungen"),
-    ("tag","document_type","Kreditvertrag",          "exact","Kredit",                 50,"Kredite und Darlehen"),
-    ("tag","document_type","Darlehensvertrag",       "exact","Kredit",                 50,"Darlehensverträge"),
-    ("tag","document_type","Mahnung",                "exact","Mahnung",                50,"Zahlungsmahnungen"),
-    ("tag","document_type","Mahnbescheid",           "exact","Mahnung",                50,"Gerichtlicher Mahnbescheid"),
-    ("tag","document_type","Quittung",               "exact","Quittung",               50,"Zahlungsquittungen"),
-    ("tag","document_type","Angebot",                "exact","Angebot",                50,"Kostenvoranschläge und Angebote"),
+    ("tag","document_type","Rechnung",               "exact","Rechnung",               50,"Eingehende Rechnungen"),
+    ("tag","document_type","Kontoauszug",             "exact","Kontoauszug",             50,"Bankkontoauszüge"),
+    ("tag","document_type","Lohnabrechnung",          "exact","Lohnabrechnung",          50,"Lohnabrechnungen"),
+    ("tag","document_type","Gehaltsabrechnung",       "exact","Lohnabrechnung",          50,"Gehaltsabrechnungen"),
+    ("tag","document_type","Lohnsteuerbescheinigung", "exact","Lohnsteuerbescheinigung", 50,"Lohnsteuerbescheinigungen"),
+    ("tag","document_type","Kreditvertrag",           "exact","Kredit",                  50,"Kreditverträge"),
+    ("tag","document_type","Darlehensvertrag",        "exact","Kredit",                  50,"Darlehensverträge"),
+    ("tag","document_type","Mahnung",                 "exact","Mahnung",                 50,"Mahnungen"),
+    ("tag","document_type","Mahnbescheid",            "exact","Mahnbescheid",            50,"Gerichtliche Mahnbescheide"),
+    ("tag","document_type","Quittung",                "exact","Quittung",                50,"Zahlungsquittungen"),
+    ("tag","document_type","Angebot",                 "exact","Angebot",                 50,"Kostenvoranschläge"),
     # Steuern
-    ("tag","document_type","Steuerbescheid",             "exact","Steuern", 50,"Steuerbescheide"),
-    ("tag","document_type","Einkommensteuerbescheid",    "exact","Steuern", 50,"Einkommensteuerbescheide"),
-    ("tag","document_type","Einkommensteuererklärung",   "exact","Steuern", 50,"Steuererklärungen"),
-    ("tag","document_type","Kirchensteuerbescheid",      "exact","Steuern", 50,"Kirchensteuerbescheide"),
-    ("tag","document_type","Umsatzsteuerbescheid",       "exact","Steuern", 50,"Umsatzsteuerbescheide"),
+    ("tag","document_type","Steuerbescheid",              "exact","Steuerbescheid",          50,"Steuerbescheide"),
+    ("tag","document_type","Einkommensteuerbescheid",     "exact","Steuerbescheid",          50,"Einkommensteuerbescheide"),
+    ("tag","document_type","Einkommensteuererklärung",    "exact","Steuererklärung",         50,"Steuererklärungen"),
+    ("tag","document_type","Kirchensteuerbescheid",       "exact","Steuerbescheid",          50,"Kirchensteuerbescheide"),
+    ("tag","document_type","Umsatzsteuerbescheid",        "exact","Steuerbescheid",          50,"Umsatzsteuerbescheide"),
     # Gesundheit
-    ("tag","document_type","Arztbrief",          "exact","Gesundheit", 50,"Arztbriefe"),
-    ("tag","document_type","Befundbericht",      "exact","Gesundheit", 50,"Medizinische Befundberichte"),
-    ("tag","document_type","Krankenhausbericht", "exact","Gesundheit", 50,"Krankenhausberichte"),
-    ("tag","document_type","Entlassungsbrief",   "exact","Gesundheit", 50,"Entlassungsbriefe aus Krankenhaus"),
-    ("tag","document_type","Rezept",             "exact","Gesundheit", 50,"Arztrezepte"),
-    ("tag","document_type","Überweisungsschein", "exact","Gesundheit", 50,"Facharzt-Überweisungen"),
-    ("tag","document_type","Krankenhausrechnung","exact","Gesundheit", 50,"Krankenhausrechnungen"),
-    ("tag","document_type","Therapiebericht",    "exact","Gesundheit", 50,"Therapieberichte"),
+    ("tag","document_type","Arztbrief",           "exact","Arztbrief",           50,"Arztbriefe"),
+    ("tag","document_type","Befundbericht",        "exact","Befund",              50,"Befundberichte"),
+    ("tag","document_type","Krankenhausbericht",   "exact","Krankenhausbericht",  50,"Krankenhausberichte"),
+    ("tag","document_type","Entlassungsbrief",     "exact","Entlassungsbrief",    50,"Entlassungsbriefe"),
+    ("tag","document_type","Rezept",               "exact","Rezept",              50,"Arztrezepte"),
+    ("tag","document_type","Überweisungsschein",   "exact","Überweisung",         50,"Arztüberweisungen"),
+    ("tag","document_type","Krankenhausrechnung",  "exact","Rechnung",            50,"Krankenhausrechnungen"),
+    ("tag","document_type","Therapiebericht",      "exact","Therapiebericht",     50,"Therapieberichte"),
     # Versicherungen
-    ("tag","document_type","Versicherungsschein",  "exact","Versicherung", 50,"Versicherungsscheine"),
-    ("tag","document_type","Versicherungspolice",  "exact","Versicherung", 50,"Versicherungspolicen"),
-    ("tag","document_type","Schadensregulierung",  "exact","Versicherung", 50,"Schadensregulierungen"),
-    ("tag","document_type","Schadensmeldung",      "exact","Versicherung", 50,"Schadensmeldungen"),
-    ("tag","document_type","Nachtragspolice",      "exact","Versicherung", 50,"Nachtragspolicen"),
+    ("tag","document_type","Versicherungsschein",  "exact","Versicherungsschein", 50,"Versicherungsscheine"),
+    ("tag","document_type","Versicherungspolice",  "exact","Versicherungsschein", 50,"Versicherungspolicen"),
+    ("tag","document_type","Schadensregulierung",  "exact","Schadensregulierung", 50,"Schadensregulierungen"),
+    ("tag","document_type","Schadensmeldung",      "exact","Schadensmeldung",     50,"Schadensmeldungen"),
+    ("tag","document_type","Nachtragspolice",      "exact","Versicherungsschein", 50,"Nachtragspolicen"),
     # Wohnen
-    ("tag","document_type","Mietvertrag",           "exact","Wohnen", 50,"Mietverträge"),
-    ("tag","document_type","Nebenkostenabrechnung", "exact","Wohnen", 50,"Nebenkostenabrechnungen"),
-    ("tag","document_type","Mieterhöhung",          "exact","Wohnen", 50,"Mieterhöhungsschreiben"),
-    ("tag","document_type","Kautionsquittung",      "exact","Wohnen", 50,"Kautionsquittungen"),
-    ("tag","document_type","Wohnungskündigung",     "exact","Wohnen", 50,"Wohnungskündigungen"),
-    ("tag","document_type","Hausgeldabrechnung",    "exact","Wohnen", 50,"WEG-Hausgeldabrechnungen"),
-    # Arbeit / Beruf
-    ("tag","document_type","Arbeitsvertrag",     "exact","Arbeit",    50,"Arbeitsverträge"),
-    ("tag","document_type","Zeugnis",            "exact","Arbeit",    50,"Arbeitszeugnisse"),
-    ("tag","document_type","Kündigungsschreiben","exact","Kündigung", 50,"Arbeitgeberkündigungen"),
-    ("tag","document_type","Abmahnung",          "exact","Arbeit",    50,"Arbeitsrechtliche Abmahnungen"),
-    # Behörden / Recht
-    ("tag","document_type","Bescheid",               "exact","Behörde",      50,"Behördenbescheide"),
-    ("tag","document_type","Behördenpost",           "exact","Behörde",      50,"Post von Behörden"),
-    ("tag","document_type","Bußgeldbescheid",        "exact","Bußgeld",      50,"Bußgeldbescheide"),
-    ("tag","document_type","Gerichtsschreiben",      "exact","Recht",        50,"Gerichtliche Korrespondenz"),
-    ("tag","document_type","Vollstreckungsbescheid", "exact","Vollstreckung",50,"Vollstreckungsbescheide"),
+    ("tag","document_type","Mietvertrag",           "exact","Mietvertrag",           50,"Mietverträge"),
+    ("tag","document_type","Nebenkostenabrechnung", "exact","Nebenkostenabrechnung", 50,"Nebenkostenabrechnungen"),
+    ("tag","document_type","Mieterhöhung",          "exact","Mieterhöhung",          50,"Mieterhöhungsschreiben"),
+    ("tag","document_type","Kautionsquittung",      "exact","Kautionsquittung",      50,"Kautionsquittungen"),
+    ("tag","document_type","Wohnungskündigung",     "exact","Kündigung",             50,"Wohnungskündigungen"),
+    ("tag","document_type","Hausgeldabrechnung",    "exact","Hausgeldabrechnung",    50,"WEG-Hausgeldabrechnungen"),
+    # Arbeit
+    ("tag","document_type","Arbeitsvertrag",     "exact","Arbeitsvertrag", 50,"Arbeitsverträge"),
+    ("tag","document_type","Zeugnis",            "exact","Zeugnis",        50,"Arbeitszeugnisse"),
+    ("tag","document_type","Kündigungsschreiben","exact","Kündigung",      50,"Kündigungen"),
+    ("tag","document_type","Abmahnung",          "exact","Abmahnung",      50,"Abmahnungen"),
+    # Behörde / Recht
+    ("tag","document_type","Bescheid",               "exact","Bescheid",            50,"Behördenbescheide"),
+    ("tag","document_type","Behördenpost",           "exact","Bescheid",            50,"Behördenpost"),
+    ("tag","document_type","Bußgeldbescheid",        "exact","Bußgeldbescheid",     50,"Bußgeldbescheide"),
+    ("tag","document_type","Gerichtsschreiben",      "exact","Gerichtsschreiben",   50,"Gerichtliche Korrespondenz"),
+    ("tag","document_type","Vollstreckungsbescheid", "exact","Vollstreckung",       50,"Vollstreckungsbescheide"),
     # KFZ
-    ("tag","document_type","Fahrzeugbrief",  "exact","KFZ", 50,"Fahrzeugbriefe"),
-    ("tag","document_type","Fahrzeugschein", "exact","KFZ", 50,"Fahrzeugscheine"),
-    ("tag","document_type","HU-Bericht",     "exact","KFZ", 50,"Hauptuntersuchung (TÜV)"),
-    ("tag","document_type","Kfz-Steuer",     "exact","KFZ", 50,"Kraftfahrzeugsteuerbescheide"),
+    ("tag","document_type","Fahrzeugbrief",  "exact","Fahrzeugdokument", 50,"Fahrzeugbriefe"),
+    ("tag","document_type","Fahrzeugschein", "exact","Fahrzeugdokument", 50,"Fahrzeugscheine"),
+    ("tag","document_type","HU-Bericht",     "exact","HU-TÜV",          50,"Hauptuntersuchung"),
+    ("tag","document_type","Kfz-Steuer",     "exact","KFZ-Steuer",      50,"Kraftfahrzeugsteuer"),
     # Telekommunikation
-    ("tag","document_type","Mobilfunkvertrag","exact","Telekommunikation", 50,"Mobilfunkverträge"),
-    ("tag","document_type","Internetvertrag", "exact","Telekommunikation", 50,"Internetverträge"),
+    ("tag","document_type","Mobilfunkvertrag","exact","Mobilfunk",  50,"Mobilfunkverträge"),
+    ("tag","document_type","Internetvertrag", "exact","Internet",   50,"Internetverträge"),
     # Sonstiges
     ("tag","document_type","Vertrag",       "exact","Vertrag",       50,"Allgemeine Verträge"),
     ("tag","document_type","Kündigung",     "exact","Kündigung",     50,"Allgemeine Kündigungen"),
     ("tag","document_type","Bescheinigung", "exact","Bescheinigung", 50,"Amtliche Bescheinigungen"),
-    ("tag","document_type","Werbung",       "exact","Werbung",       50,"Werbung und Marketing"),
+    ("tag","document_type","Werbung",       "exact","Werbung",       50,"Werbung"),
 
-    # ── B) Organisation → Tag ────────────────────────────────────────────────
-    # Gesetzliche Krankenversicherungen
-    ("tag","organization","Techniker Krankenkasse",    "contains","Krankenversicherung", 40,"TK"),
-    ("tag","organization","Barmer",                    "contains","Krankenversicherung", 40,"Barmer"),
-    ("tag","organization","AOK",                       "contains","Krankenversicherung", 40,"AOK"),
-    ("tag","organization","DAK",                       "contains","Krankenversicherung", 40,"DAK"),
-    ("tag","organization","IKK",                       "contains","Krankenversicherung", 40,"IKK"),
-    ("tag","organization","Knappschaft",               "contains","Krankenversicherung", 40,"Knappschaft"),
-    ("tag","organization","BKK",                       "contains","Krankenversicherung", 40,"BKK"),
-    ("tag","organization","Hanseatische Krankenkasse", "contains","Krankenversicherung", 40,"HEK"),
-    ("tag","organization","hkk",                       "contains","Krankenversicherung", 40,"hkk"),
-    # Rentenversicherung
-    ("tag","organization","Deutsche Rentenversicherung","contains","Rente", 40,"DRV"),
-    ("tag","organization","Rentenversicherung",         "contains","Rente", 40,"Rentenversicherung"),
-    # Behörden
-    ("tag","organization","Bundesagentur für Arbeit","contains","Arbeitsagentur",  40,"BA für Arbeit"),
-    ("tag","organization","Jobcenter",               "contains","Jobcenter",       40,"Jobcenter"),
-    ("tag","organization","Finanzamt",               "contains","Steuern",         40,"Finanzamt"),
-    ("tag","organization","Bundeszentralamt",        "contains","Steuern",         40,"Bundeszentralamt"),
-    ("tag","organization","Amtsgericht",             "contains","Recht",           40,"Amtsgericht"),
-    ("tag","organization","Landgericht",             "contains","Recht",           40,"Landgericht"),
-    ("tag","organization","Oberlandesgericht",       "contains","Recht",           40,"OLG"),
-    ("tag","organization","Rechtsanwalt",            "contains","Recht",           40,"Anwaltskanzlei"),
-    ("tag","organization","Inkasso",                 "contains","Mahnung",         40,"Inkasso-Büro"),
-    ("tag","organization","Ordnungsamt",             "contains","Behörde",         40,"Ordnungsamt"),
-    ("tag","organization","Bürgeramt",               "contains","Behörde",         40,"Bürgeramt"),
-    ("tag","organization","Einwohnermeldeamt",       "contains","Behörde",         40,"Einwohnermeldeamt"),
-    ("tag","organization","Jugendamt",               "contains","Behörde",         40,"Jugendamt"),
-    ("tag","organization","Sozialamt",               "contains","Sozialleistungen",40,"Sozialamt"),
-    ("tag","organization","Versorgungsamt",          "contains","Behörde",         40,"Versorgungsamt"),
-    ("tag","organization","Zoll",                    "contains","Behörde",         40,"Zoll"),
-    # Energie / Versorger
-    ("tag","organization","Stadtwerke", "contains","Energie", 40,"Stadtwerke"),
-    ("tag","organization","E.ON",       "contains","Energie", 40,"E.ON"),
-    ("tag","organization","RWE",        "contains","Energie", 40,"RWE"),
-    ("tag","organization","EnBW",       "contains","Energie", 40,"EnBW"),
-    ("tag","organization","Vattenfall", "contains","Energie", 40,"Vattenfall"),
-    ("tag","organization","Innogy",     "contains","Energie", 40,"Innogy"),
-    # Telekommunikation
-    ("tag","organization","Telekom",   "contains","Telekommunikation", 40,"Telekom"),
-    ("tag","organization","Vodafone",  "contains","Telekommunikation", 40,"Vodafone"),
-    ("tag","organization","O2",        "contains","Telekommunikation", 40,"O2"),
-    ("tag","organization","1&1",       "contains","Telekommunikation", 40,"1&1"),
-    ("tag","organization","Freenet",   "contains","Telekommunikation", 40,"Freenet"),
-    ("tag","organization","Unitymedia","contains","Telekommunikation", 40,"Unitymedia"),
-    ("tag","organization","Congstar",  "contains","Telekommunikation", 40,"Congstar"),
-    # Banken
-    ("tag","organization","Sparkasse",     "contains","Bank", 40,"Sparkasse"),
-    ("tag","organization","Volksbank",     "contains","Bank", 40,"Volksbank"),
-    ("tag","organization","Raiffeisenbank","contains","Bank", 40,"Raiffeisenbank"),
-    ("tag","organization","Commerzbank",   "contains","Bank", 40,"Commerzbank"),
-    ("tag","organization","Deutsche Bank", "contains","Bank", 40,"Deutsche Bank"),
-    ("tag","organization","DKB",           "contains","Bank", 40,"DKB"),
-    ("tag","organization","ING",           "contains","Bank", 40,"ING"),
-    ("tag","organization","Postbank",      "contains","Bank", 40,"Postbank"),
-    ("tag","organization","Comdirect",     "contains","Bank", 40,"Comdirect"),
-    ("tag","organization","N26",           "contains","Bank", 40,"N26"),
-    ("tag","organization","Targobank",     "contains","Bank", 40,"Targobank"),
-    # Versicherungen
-    ("tag","organization","Allianz",     "contains","Versicherung", 40,"Allianz"),
-    ("tag","organization","HUK",         "contains","Versicherung", 40,"HUK"),
-    ("tag","organization","AXA",         "contains","Versicherung", 40,"AXA"),
-    ("tag","organization","Generali",    "contains","Versicherung", 40,"Generali"),
-    ("tag","organization","Zurich",      "contains","Versicherung", 40,"Zurich"),
-    ("tag","organization","R+V",         "contains","Versicherung", 40,"R+V"),
-    ("tag","organization","DEVK",        "contains","Versicherung", 40,"DEVK"),
-    ("tag","organization","Ergo",        "contains","Versicherung", 40,"Ergo"),
-    ("tag","organization","Debeka",      "contains","Versicherung", 40,"Debeka"),
-    ("tag","organization","Signal Iduna","contains","Versicherung", 40,"Signal Iduna"),
-    ("tag","organization","VHV",         "contains","Versicherung", 40,"VHV"),
-    ("tag","organization","Gothaer",     "contains","Versicherung", 40,"Gothaer"),
-    # Rundfunkbeitrag
-    ("tag","organization","Beitragsservice","contains","Rundfunkbeitrag", 40,"GEZ/Beitragsservice"),
-    ("tag","organization","GEZ",            "contains","Rundfunkbeitrag", 40,"GEZ"),
-
-    # ── C) Schlüsselwort im OCR-Text → Tag ──────────────────────────────────
+    # ── B) Schlüsselwort im OCR-Text → Blatt-Tag  (semantisch, firmenunabhängig)
     ("tag","keyword","mahnung",             "contains","Mahnung",            30,"Mahnung via Volltext"),
     ("tag","keyword","zahlungserinnerung",  "contains","Mahnung",            30,"Zahlungserinnerung"),
     ("tag","keyword","inkasso",             "contains","Mahnung",            30,"Inkasso via Volltext"),
     ("tag","keyword","vollstreckung",       "contains","Vollstreckung",      30,"Vollstreckung via Volltext"),
     ("tag","keyword","zwangsvollstreckung", "contains","Vollstreckung",      30,"Zwangsvollstreckung"),
     ("tag","keyword","insolvenz",           "contains","Insolvenz",          30,"Insolvenz via Volltext"),
-    ("tag","keyword","kfz-steuer",          "contains","KFZ",                30,"Kfz-Steuer → KFZ"),
-    ("tag","keyword","kraftfahrzeugsteuer", "contains","KFZ",                30,"Kraftfahrzeugsteuer → KFZ"),
-    ("tag","keyword","fahrzeugschein",      "contains","KFZ",                30,"Fahrzeugschein → KFZ"),
-    ("tag","keyword","hauptuntersuchung",   "contains","KFZ",                30,"TÜV/HU → KFZ"),
-    ("tag","keyword","kindergeld",          "contains","Familie",            30,"Kindergeld → Familie"),
-    ("tag","keyword","elterngeld",          "contains","Familie",            30,"Elterngeld → Familie"),
-    ("tag","keyword","unterhalt",           "contains","Familie",            30,"Unterhalt → Familie"),
-    ("tag","keyword","betreuungsgeld",      "contains","Familie",            30,"Betreuungsgeld → Familie"),
-    ("tag","keyword","rentenbescheid",      "contains","Rente",              30,"Rentenbescheid → Rente"),
-    ("tag","keyword","rentenanpassung",     "contains","Rente",              30,"Rentenanpassung → Rente"),
-    ("tag","keyword","wohngeld",            "contains","Sozialleistungen",   30,"Wohngeld → Sozialleistungen"),
-    ("tag","keyword","sozialhilfe",         "contains","Sozialleistungen",   30,"Sozialhilfe"),
+    ("tag","keyword","kfz-steuer",          "contains","KFZ-Steuer",         30,"Kfz-Steuer via Volltext"),
+    ("tag","keyword","kraftfahrzeugsteuer", "contains","KFZ-Steuer",         30,"Kraftfahrzeugsteuer"),
+    ("tag","keyword","hauptuntersuchung",   "contains","HU-TÜV",             30,"TÜV/HU via Volltext"),
+    ("tag","keyword","kindergeld",          "contains","Kindergeld",         30,"Kindergeld"),
+    ("tag","keyword","elterngeld",          "contains","Elterngeld",         30,"Elterngeld"),
+    ("tag","keyword","unterhalt",           "contains","Unterhalt",          30,"Unterhalt"),
+    ("tag","keyword","betreuungsgeld",      "contains","Elterngeld",         30,"Betreuungsgeld"),
+    ("tag","keyword","rentenbescheid",      "contains","Rentenbescheid",     30,"Rentenbescheid"),
+    ("tag","keyword","rentenanpassung",     "contains","Rentenbescheid",     30,"Rentenanpassung"),
+    ("tag","keyword","wohngeld",            "contains","Wohngeld",           30,"Wohngeld"),
+    ("tag","keyword","sozialhilfe",         "contains","Sozialhilfe",        30,"Sozialhilfe"),
     ("tag","keyword","datenschutz",         "contains","Datenschutz",        30,"Datenschutz-Schreiben"),
-    ("tag","keyword","dsgvo",               "contains","Datenschutz",        30,"DSGVO-Schreiben"),
+    ("tag","keyword","dsgvo",               "contains","Datenschutz",        30,"DSGVO"),
     ("tag","keyword","abmahnung",           "contains","Abmahnung",          30,"Abmahnung erkannt"),
-    ("tag","keyword","beitragsrechnung",    "contains","Versicherung",       30,"Versicherungsbeitragsrechnung"),
     ("tag","keyword","krankenversicherung", "contains","Krankenversicherung",30,"Krankenversicherung via Volltext"),
     ("tag","keyword","pflegeversicherung",  "contains","Pflegeversicherung", 30,"Pflegeversicherung"),
-    ("tag","keyword","steuernummer",        "contains","Steuern",            30,"Steuernummer → Steuer-Dokument"),
-    ("tag","keyword","steuer-id",           "contains","Steuern",            30,"Steuer-ID → Steuer-Dokument"),
-    ("tag","keyword","finanzamt",           "contains","Steuern",            30,"Finanzamt via Volltext"),
-
-    # ── D) Korrespondent: Absender-Normalisierung ────────────────────────────
-    ("correspondent","sender","Techniker Krankenkasse",     "contains","Techniker Krankenkasse",     20,"TK normieren"),
-    ("correspondent","sender","Barmer",                     "contains","Barmer",                     20,"Barmer normieren"),
-    ("correspondent","sender","AOK",                        "contains","AOK",                        20,"AOK normieren"),
-    ("correspondent","sender","DAK",                        "contains","DAK-Gesundheit",              20,"DAK normieren"),
-    ("correspondent","sender","IKK",                        "contains","IKK",                        20,"IKK normieren"),
-    ("correspondent","sender","Deutsche Rentenversicherung","contains","Deutsche Rentenversicherung", 20,"DRV normieren"),
-    ("correspondent","sender","Bundesagentur für Arbeit",   "contains","Bundesagentur für Arbeit",   20,"BA normieren"),
-    ("correspondent","sender","Jobcenter",                  "contains","Jobcenter",                  20,"Jobcenter normieren"),
-    ("correspondent","sender","Finanzamt",                  "contains","Finanzamt",                  20,"Finanzamt normieren"),
-    ("correspondent","sender","Amtsgericht",                "contains","Amtsgericht",                20,"Amtsgericht normieren"),
-    ("correspondent","sender","Landgericht",                "contains","Landgericht",                20,"Landgericht normieren"),
-    ("correspondent","sender","Allianz",                    "contains","Allianz",                    20,"Allianz normieren"),
-    ("correspondent","sender","HUK",                        "contains","HUK-COBURG",                 20,"HUK normieren"),
-    ("correspondent","sender","AXA",                        "contains","AXA",                        20,"AXA normieren"),
-    ("correspondent","sender","DEVK",                       "contains","DEVK",                       20,"DEVK normieren"),
-    ("correspondent","sender","Ergo",                       "contains","Ergo",                       20,"Ergo normieren"),
-    ("correspondent","sender","Debeka",                     "contains","Debeka",                     20,"Debeka normieren"),
-    ("correspondent","sender","Signal Iduna",               "contains","Signal Iduna",                20,"Signal Iduna normieren"),
-    ("correspondent","sender","Stadtwerke",                 "contains","Stadtwerke",                 20,"Stadtwerke normieren"),
-    ("correspondent","sender","Telekom",                    "contains","Deutsche Telekom",            20,"Telekom normieren"),
-    ("correspondent","sender","Vodafone",                   "contains","Vodafone",                   20,"Vodafone normieren"),
-    ("correspondent","sender","1&1",                        "contains","1&1",                        20,"1&1 normieren"),
-    ("correspondent","sender","Sparkasse",                  "contains","Sparkasse",                  20,"Sparkasse normieren"),
-    ("correspondent","sender","Volksbank",                  "contains","Volksbank",                  20,"Volksbank normieren"),
-    ("correspondent","sender","Commerzbank",                "contains","Commerzbank",                20,"Commerzbank normieren"),
-    ("correspondent","sender","Deutsche Bank",              "contains","Deutsche Bank",              20,"Deutsche Bank normieren"),
-    ("correspondent","sender","DKB",                        "contains","DKB Deutsche Kreditbank",    20,"DKB normieren"),
-    ("correspondent","sender","ING",                        "contains","ING",                        20,"ING normieren"),
-    ("correspondent","sender","Postbank",                   "contains","Postbank",                   20,"Postbank normieren"),
-    ("correspondent","sender","Beitragsservice",            "contains","ARD ZDF Beitragsservice",    20,"GEZ normieren"),
+    ("tag","keyword","steuernummer",        "contains","Steuerbescheid",     30,"Steuernummer im Text"),
+    ("tag","keyword","finanzamt",           "contains","Steuerbescheid",     30,"Finanzamt via Volltext"),
 ]
 
-# ai_analyzer – Metadaten-Extraktion
-_DEFAULT_AI_ANALYZER_SYSTEM = (
-    "Du bist ein erfahrener Dokumentenarchivarius für deutschsprachige "
-    "Privat- und Geschäftsdokumente. Extrahiere Metadaten präzise und "
-    "antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt."
-)
 
-_DEFAULT_AI_ANALYZER_USER_TEMPLATE = """
-Analysiere den folgenden deutschen Dokumententext und extrahiere die Metadaten.
-Antworte AUSSCHLIESSLICH mit einem gültigen JSON-Objekt mit diesen Feldern:
-- sender: Absender (Name/Firma oder null)
-- document_date: Datum auf dem Dokument (Format YYYY-MM-DD oder null)
-- document_type: Typ (Rechnung, Kontoauszug, Versicherung, Behördenpost, Arztbrief, Vertrag, Werbung, Sonstiges)
-- reference_number: Aktenzeichen/Rechnungsnummer oder null
-- confidence: Deine Gesamtkonfidenz (0.0–1.0)
-- recipient_names: Liste der im Dokument genannten Empfängernamen (leer wenn keine gefunden)
-- organizations: Liste der genannten Firmen/Behörden (leer wenn keine)
+# ---------------------------------------------------------------------------
+# Tag-Hierarchie  (tag → parent_tag | None = Root)
+# Identisch mit den INSERT IGNORE-Blöcken in database.sql.
+# Format: (tag, parent_tag | None, sort_order)
+#
+# Struktur (Auszug):
+#   Finanzen
+#     Rechnung        Kontoauszug
+#     Kredit
+#     Steuern
+#       Steuerbescheid / Steuererklärung / Lohnsteuerbescheinigung
+#     Gehalt / Lohnabrechnung
+#     Mahnung
+#       Vollstreckung / Insolvenz
+#     Quittung / Angebot
+#   Gesundheit
+#     Arztbrief / Befund / Rezept / Überweisung / Therapiebericht
+#     Krankenhaus
+#       Krankenhausbericht / Entlassungsbrief
+#   Versicherung
+#     Krankenversicherung
+#       Gesetzliche Krankenversicherung / Private Krankenversicherung
+#     Pflegeversicherung / KFZ-Versicherung / Haftpflicht
+#     Lebensversicherung / Hausratversicherung / Rentenversicherung
+#     Versicherungsschein / Schadensmeldung / Schadensregulierung
+#   Vertrag
+#     Mietvertrag / Arbeitsvertrag / Mobilfunkvertrag
+#     Internetvertrag / Kredit / Versicherungsschein
+#   Wohnen
+#     Mietvertrag / Nebenkostenabrechnung / Mieterhöhung
+#     Kautionsquittung / Hausgeldabrechnung
+#   Arbeit
+#     Arbeitsvertrag / Zeugnis / Abmahnung / Lohnabrechnung
+#   Behörde
+#     Bescheid / Steuerbescheid / Bußgeldbescheid / Bescheinigung
+#     Rentenbescheid
+#   Sozialleistungen
+#     Kindergeld / Elterngeld / Wohngeld / Sozialhilfe / Unterhalt
+#   Recht
+#     Gerichtsschreiben / Mahnbescheid / Vollstreckung / Kündigung / Abmahnung
+#   KFZ
+#     Fahrzeugdokument
+#       Fahrzeugbrief / Fahrzeugschein
+#     KFZ-Steuer / HU-TÜV / KFZ-Versicherung
+#   Telekommunikation
+#     Mobilfunk / Internet
+#   Familie
+#     Kindergeld / Elterngeld / Unterhalt / Betreuung
+#   Datenschutz
+#     DSGVO
+# ---------------------------------------------------------------------------
+_BUILTIN_HIERARCHY: list[tuple[str, str | None, int]] = [
+    # ── Wurzel-Kategorien (parent = None) ──────────────────────────────────
+    ("Finanzen",          None,          0),
+    ("Gesundheit",        None,          1),
+    ("Versicherung",      None,          2),
+    ("Vertrag",           None,          3),
+    ("Wohnen",            None,          4),
+    ("Arbeit",            None,          5),
+    ("Behörde",           None,          6),
+    ("Sozialleistungen",  None,          7),
+    ("Recht",             None,          8),
+    ("KFZ",               None,          9),
+    ("Telekommunikation", None,         10),
+    ("Familie",           None,         11),
+    ("Datenschutz",       None,         12),
+
+    # ── Finanzen ────────────────────────────────────────────────────────────
+    ("Rechnung",                 "Finanzen",   0),
+    ("Kontoauszug",              "Finanzen",   1),
+    ("Kredit",                   "Finanzen",   2),
+    ("Steuern",                  "Finanzen",   3),
+    ("Gehalt",                   "Finanzen",   4),
+    ("Lohnabrechnung",           "Gehalt",     0),
+    ("Lohnsteuerbescheinigung",  "Steuern",    0),
+    ("Steuerbescheid",           "Steuern",    1),
+    ("Steuererklärung",          "Steuern",    2),
+    ("Mahnung",                  "Finanzen",   5),
+    ("Vollstreckung",            "Recht",      0),
+    ("Insolvenz",                "Recht",      1),
+    ("Mahnbescheid",             "Recht",      2),
+    ("Quittung",                 "Finanzen",   6),
+    ("Angebot",                  "Finanzen",   7),
+
+    # ── Gesundheit ──────────────────────────────────────────────────────────
+    ("Arztbrief",                "Gesundheit", 0),
+    ("Befund",                   "Gesundheit", 1),
+    ("Rezept",                   "Gesundheit", 2),
+    ("Überweisung",              "Gesundheit", 3),
+    ("Therapiebericht",          "Gesundheit", 4),
+    ("Krankenhaus",              "Gesundheit", 5),
+    ("Krankenhausbericht",       "Krankenhaus", 0),
+    ("Entlassungsbrief",         "Krankenhaus", 1),
+
+    # ── Versicherung ────────────────────────────────────────────────────────
+    ("Krankenversicherung",           "Versicherung", 0),
+    ("Gesetzliche Krankenversicherung","Krankenversicherung", 0),
+    ("Private Krankenversicherung",    "Krankenversicherung", 1),
+    ("Pflegeversicherung",            "Versicherung", 1),
+    ("KFZ-Versicherung",              "Versicherung", 2),
+    ("Haftpflicht",                   "Versicherung", 3),
+    ("Lebensversicherung",            "Versicherung", 4),
+    ("Hausratversicherung",           "Versicherung", 5),
+    ("Rentenversicherung",            "Versicherung", 6),
+    ("Versicherungsschein",           "Versicherung", 7),
+    ("Schadensmeldung",               "Versicherung", 8),
+    ("Schadensregulierung",           "Versicherung", 9),
+
+    # ── Vertrag ─────────────────────────────────────────────────────────────
+    ("Mietvertrag",     "Vertrag", 0),
+    ("Arbeitsvertrag",  "Vertrag", 1),
+    ("Mobilfunkvertrag","Vertrag", 2),
+    ("Internetvertrag", "Vertrag", 3),
+
+    # ── Wohnen ──────────────────────────────────────────────────────────────
+    ("Nebenkostenabrechnung", "Wohnen", 0),
+    ("Mieterhöhung",          "Wohnen", 1),
+    ("Kautionsquittung",      "Wohnen", 2),
+    ("Hausgeldabrechnung",    "Wohnen", 3),
+
+    # ── Arbeit ──────────────────────────────────────────────────────────────
+    ("Zeugnis",     "Arbeit", 0),
+    ("Abmahnung",   "Arbeit", 1),
+
+    # ── Behörde ─────────────────────────────────────────────────────────────
+    ("Bescheid",         "Behörde", 0),
+    ("Bußgeldbescheid",  "Behörde", 1),
+    ("Bescheinigung",    "Behörde", 2),
+    ("Rentenbescheid",   "Behörde", 3),
+
+    # ── Sozialleistungen ────────────────────────────────────────────────────
+    ("Kindergeld",  "Sozialleistungen", 0),
+    ("Elterngeld",  "Sozialleistungen", 1),
+    ("Wohngeld",    "Sozialleistungen", 2),
+    ("Sozialhilfe", "Sozialleistungen", 3),
+    ("Unterhalt",   "Sozialleistungen", 4),
+
+    # ── Recht ───────────────────────────────────────────────────────────────
+    ("Gerichtsschreiben", "Recht", 3),
+    ("Kündigung",         "Recht", 4),
+
+    # ── KFZ ─────────────────────────────────────────────────────────────────
+    ("Fahrzeugdokument", "KFZ",             0),
+    ("Fahrzeugbrief",    "Fahrzeugdokument",0),
+    ("Fahrzeugschein",   "Fahrzeugdokument",1),
+    ("KFZ-Steuer",       "KFZ",             1),
+    ("HU-TÜV",           "KFZ",             2),
+
+    # ── Telekommunikation ───────────────────────────────────────────────────
+    ("Mobilfunk", "Telekommunikation", 0),
+    ("Internet",  "Telekommunikation", 1),
+
+    # ── Familie ─────────────────────────────────────────────────────────────
+    ("Betreuung", "Familie", 0),
+
+    # ── Datenschutz ─────────────────────────────────────────────────────────
+    ("DSGVO",      "Datenschutz", 0),
+
+    # ── Cross-Referenzen (Duplikat-Einträge werden von INSERT IGNORE ignoriert)
+    # Mietvertrag gehört auch zu Wohnen → extra Regel über assignment_rules,
+    # denn in der Hierarchie hat jeder Tag genau einen Eltern-Knoten.
+]
+
+
+# ---------------------------------------------------------------------------
+# Tag-Hierarchie-Expansion
+# ---------------------------------------------------------------------------
+
+def expand_tags(
+    tags: list[str],
+    hierarchy: dict[str, str | None],
+) -> list[str]:
+    """Ergänzt für jeden Tag alle Vorfahren bis zur Wurzel.
+
+    Beispiel:
+        tags      = ["Arztbrief"]
+        hierarchy = {"Arztbrief": "Gesundheit", "Gesundheit": None, ...}
+        →  ["Arztbrief", "Gesundheit"]
+
+    Duplikate werden entfernt; die Reihenfolge bleibt erhalten
+    (Blatt-Tags zuerst, Wurzel-Tags zuletzt).
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+    depth_limit = 20  # Schutz vor Endlosschleifen; 20 Ebenen sind mehr als ausreichend
+
+    for tag in tags:
+        if tag not in seen:
+            result.append(tag)
+            seen.add(tag)
+        # Vorfahren ergänzen
+        current = tag
+        depth = 0
+        while depth < depth_limit:
+            parent = hierarchy.get(current)
+            if parent is None:
+                break
+            if parent not in seen:
+                result.append(parent)
+                seen.add(parent)
+            elif depth == depth_limit - 1:
+                logger.warning(
+                    "expand_tags: Hierarchie-Tiefe von %d erreicht für Tag %r – "
+                    "prüfe auf Zyklen in der tag_hierarchy-Tabelle.",
+                    depth_limit, tag,
+                )
+            current = parent
+            depth += 1
+
+    return result
+
+
+_DEFAULT_AI_ANALYZER_SYSTEM = """\
+Du bist ein erfahrener Dokumentenarchivarius für deutschsprachige Privat- und \
+Geschäftsdokumente. Du erkennst den INHALTLICHEN KONTEXT eines Dokuments, \
+nicht nur Schlüsselwörter. Antworte AUSSCHLIESSLICH mit einem validen \
+JSON-Objekt, ohne Markdown oder erklärender Text.\
+"""
+
+_DEFAULT_AI_ANALYZER_USER_TEMPLATE = """\
+Analysiere den folgenden deutschen Dokumententext und extrahiere alle Metadaten.
+
+WICHTIG für das Datum (document_date):
+- Suche nach dem Briefdatum / Ausstellungsdatum / Rechnungsdatum.
+- Akzeptierte Formate im Quelltext: "27. März 2026", "27.03.2026", "2026-03-27",
+  "März 2026", "03/2026" – konvertiere IMMER nach ISO 8601: YYYY-MM-DD.
+- Bei unvollständigen Datumsangaben (nur Monat/Jahr): verwende den 1. des Monats.
+- Gibt es kein Datum: null.
+
+WICHTIG für topic_tags:
+- Bestimme 2–6 semantische Tags, die den INHALT beschreiben (nicht die Firma).
+- Beispiele: "Krankenversicherung", "Steuerbescheid", "Mietvertrag", "Mahnung",
+  "Arztbrief", "Kündigung", "Rentenversicherung", "KFZ-Steuer", "Kindergeld" …
+- Verwende Tags aus der bestehenden Hierarchie wenn passend:
+  Finanzen, Gesundheit, Versicherung, Vertrag, Wohnen, Arbeit, Behörde,
+  Sozialleistungen, Recht, KFZ, Telekommunikation, Familie, Datenschutz
+  (+ Unter-Tags der jeweiligen Kategorie).
+- Keine Firmennamen als Tags!
 
 Dokumententext:
+---
 {text}
+---
 
-JSON:
-""".strip()
+Antworte mit GENAU diesem JSON:
+{{
+  "sender": "Absender (Name/Firma oder null)",
+  "recipient_names": ["Name 1", "Name 2"],
+  "document_date": "YYYY-MM-DD oder null",
+  "document_type": "Exakter Typ: Rechnung | Arztbrief | Mietvertrag | Steuerbescheid | …",
+  "topic_tags": ["Tag1", "Tag2"],
+  "organizations": ["Firma oder Behörde 1", "Firma 2"],
+  "reference_number": "Aktenzeichen/Rechnungsnr. oder null",
+  "confidence": 0.9
+}}\
+"""
 
 # pre_classifier – Phase 1: Einzeldokument
 _DEFAULT_PRECLASSIFIER_PHASE1_SYSTEM = (
@@ -744,3 +895,29 @@ def ensure_defaults(
     cursor.close()
     logger.info("DB-Standards sichergestellt (Prompts + %d eingebaute Regeln).",
                 len(_BUILTIN_RULES))
+
+    # ── 5. Tag-Hierarchie seeden ─────────────────────────────────────────────
+    _seed_tag_hierarchy(conn)
+
+
+def _seed_tag_hierarchy(conn: mysql.connector.MySQLConnection) -> None:
+    """Trägt die eingebaute Tag-Hierarchie per INSERT IGNORE in die DB ein."""
+    cursor = conn.cursor()
+    try:
+        cursor.executemany(
+            """
+            INSERT IGNORE INTO tag_hierarchy (tag, parent_tag, sort_order)
+            VALUES (%s, %s, %s)
+            """,
+            _BUILTIN_HIERARCHY,
+        )
+        conn.commit()
+        logger.debug(
+            "Tag-Hierarchie per INSERT IGNORE sichergestellt (%d Einträge).",
+            len(_BUILTIN_HIERARCHY),
+        )
+    except Exception as exc:
+        logger.warning("tag_hierarchy konnte nicht geseedet werden: %s", exc)
+        conn.rollback()
+    finally:
+        cursor.close()

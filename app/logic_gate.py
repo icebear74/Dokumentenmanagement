@@ -31,7 +31,7 @@ from pathlib import Path
 import mysql.connector
 
 from config_loader import AppConfig, configure_logging, load_config
-from db_rules import RulesCache, apply_rules, ensure_defaults
+from db_rules import RulesCache, apply_rules, expand_tags, ensure_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -54,16 +54,23 @@ def assign_document(
 
     Returns:
         Dict mit 'recipient' (Liste, nur erster Treffer relevant),
-        'tags' und 'correspondents' (alle Treffer).
+        'tags' (LLM topic_tags + Regel-Tags + alle Vorfahren in der Hierarchie)
+        und 'correspondents' (alle Treffer).
     """
     doc_fields = {
         "sender":          sidecar_data.get("sender") or "",
         "recipient_names": sidecar_data.get("recipient_names") or [],
         "document_type":   sidecar_data.get("document_type") or "",
+        "topic_tags":      sidecar_data.get("topic_tags") or [],
         "organizations":   sidecar_data.get("organizations") or [],
         "ocr_text":        ocr_text,
     }
-    return apply_rules(doc_fields, cache.get_rules())
+    assignments = apply_rules(doc_fields, cache.get_rules())
+    # Hierarchie-Expansion: für jeden Tag alle Vorfahren ergänzen
+    hierarchy = cache.get_hierarchy()
+    if hierarchy:
+        assignments["tags"] = expand_tags(assignments["tags"], hierarchy)
+    return assignments
 
 
 def _load_ocr_text(
@@ -153,7 +160,8 @@ def process_analyzed_files(
 
         # Sidecar aktualisieren
         data["recipient"] = recipient
-        data["tags"] = tags
+        data["assigned_tags"] = tags      # vollständige hierarchie-expandierte Tags
+        data["tags"] = tags               # Rückwärtskompatibilität
         data["correspondent"] = correspondent
         data["status"] = "logic_assigned"
         sidecar_path.write_text(

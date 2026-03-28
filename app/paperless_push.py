@@ -123,18 +123,26 @@ def process_ingested_documents(
         doc_type = data.get("document_type", config.paperless.default_document_type)
         sender = data.get("sender")
         recipient = data.get("recipient", "unknown")
-        doc_date = data.get("document_date")
+        doc_date = data.get("document_date")   # already ISO YYYY-MM-DD or None
 
-        # Tag aus Mapping ermitteln
-        tag_name = config.tag_mapping.get(doc_type, "Unsortiert")
+        # Tags: logic_gate schreibt die vollständige, hierarchie-expandierte
+        # Tag-Liste in den Sidecar (Schlüssel "assigned_tags").
+        # Fallback: config.tag_mapping für ältere Sidecars ohne assigned_tags.
+        assigned_tags: list[str] = data.get("assigned_tags") or []
+        if not assigned_tags:
+            tag_name = config.tag_mapping.get(doc_type, "Unsortiert")
+            assigned_tags = [tag_name]
+
         # Empfänger als zusätzlichen Tag hinzufügen
-        tags = [tag_name]
-        if recipient == "me":
-            tags.append("Ich")
-        elif recipient == "partner":
-            tags.append("Partner")
+        if recipient == "me" and "Ich" not in assigned_tags:
+            assigned_tags.append("Ich")
+        elif recipient == "partner" and "Partner" not in assigned_tags:
+            assigned_tags.append("Partner")
 
-        # Titel zusammensetzen
+        # Korrespondent: logic_gate schreibt ersten Korrespondenten in "correspondent"
+        correspondent = data.get("correspondent") or sender
+
+        # Titel: Absender – Datum – Dokumenttyp
         title_parts = []
         if sender:
             title_parts.append(sender)
@@ -145,18 +153,19 @@ def process_ingested_documents(
         title = " – ".join(title_parts) if title_parts else pdf_path.stem
 
         logger.info(
-            "Sende an Paperless: %s (Typ=%s, Tags=%s, Empfänger=%s)",
+            "Sende an Paperless: %s (Typ=%s, Tags=%s, Datum=%s, Korrespondent=%s)",
             filename,
             doc_type,
-            tags,
-            recipient,
+            assigned_tags,
+            doc_date or "kein Datum",
+            correspondent or "–",
         )
 
         task_id = client.upload_document(
             pdf_path=pdf_path,
             title=title,
-            tag_names=tags,
-            correspondent_name=sender,
+            tag_names=assigned_tags,
+            correspondent_name=correspondent,
             created_date=doc_date,
         )
 
@@ -177,7 +186,10 @@ def process_ingested_documents(
                     paperless_tag = %s
                 WHERE uuid = %s
                 """,
-                (tag_name, data["uuid"]),
+                (
+                    ",".join(assigned_tags) if assigned_tags else None,
+                    data["uuid"],
+                ),
             )
             conn.commit()
 
