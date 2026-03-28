@@ -1,0 +1,274 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # MariaDB 11.7 – Vektordatenbank mit HNSW-Index
+  # ---------------------------------------------------------------------------
+  mariadb:
+    image: mariadb:11.7
+    container_name: doc_mariadb
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME:-document_archive}
+      MYSQL_USER: ${DB_USER:-archive_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ${DB_DATA_DIR:-/data/mariadb}:/var/lib/mysql
+      - ./database.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # Watcher – überwacht /scans, erkennt Patch-T Codes, splittet PDFs
+  # GPU: keine (reine Dateioperationen + Barcode-Erkennung auf CPU)
+  # ---------------------------------------------------------------------------
+  watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: watcher
+    container_name: doc_watcher
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: watcher
+      NVIDIA_VISIBLE_DEVICES: "none"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${SCAN_INPUT_DIR:-/data/scans}:/data/scans
+      - ${SPLIT_OUTPUT_DIR:-/data/split}:/data/split
+      - ${TMP_DIR:-/data/tmp}:/data/tmp
+      - ${LOG_DIR:-/data/logs}:/data/logs
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # AI-Analyzer – Metadaten-Extraktion (Absender, Datum, Typ, Aktenzeichen)
+  # GPU 0: Tesla P100 (Vision-Analyse & LLM-Chat)
+  # ---------------------------------------------------------------------------
+  ai_analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ai_analyzer
+    container_name: doc_ai_analyzer
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: ai_analyzer
+      NVIDIA_VISIBLE_DEVICES: ${VISION_GPU_ID:-0}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${SPLIT_OUTPUT_DIR:-/data/split}:/data/split
+      - ${ANALYZED_OUTPUT_DIR:-/data/analyzed}:/data/analyzed
+      - ${QUARANTINE_DIR:-/data/quarantine}:/data/quarantine
+      - ${TMP_DIR:-/data/tmp}:/data/tmp
+      - ${LOG_DIR:-/data/logs}:/data/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VISION_GPU_ID:-0}"]
+              capabilities: [gpu]
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # Logic-Gate – Empfängerzuweisung ("Ich" vs. "Freundin") via Config-Namen
+  # GPU: keine (reine Logik)
+  # ---------------------------------------------------------------------------
+  logic_gate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: logic_gate
+    container_name: doc_logic_gate
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: logic_gate
+      NVIDIA_VISIBLE_DEVICES: "none"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${ANALYZED_OUTPUT_DIR:-/data/analyzed}:/data/analyzed
+      - ${LOG_DIR:-/data/logs}:/data/logs
+    depends_on:
+      - ai_analyzer
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # Vector-Ingest – 768-Dim Embeddings + MariaDB HNSW
+  # GPU 1: Tesla P4 (Text-Embeddings)
+  # ---------------------------------------------------------------------------
+  vector_ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: vector_ingest
+    container_name: doc_vector_ingest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: vector_ingest
+      NVIDIA_VISIBLE_DEVICES: ${EMBEDDING_GPU_ID:-1}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${ANALYZED_OUTPUT_DIR:-/data/analyzed}:/data/analyzed
+      - ${LOG_DIR:-/data/logs}:/data/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${EMBEDDING_GPU_ID:-1}"]
+              capabilities: [gpu]
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      logic_gate:
+        condition: service_started
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # Paperless-Push – übergibt Dokumente an Paperless-ngx REST-API
+  # GPU: keine
+  # ---------------------------------------------------------------------------
+  paperless_push:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: paperless_push
+    container_name: doc_paperless_push
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: paperless_push
+      NVIDIA_VISIBLE_DEVICES: "none"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${ANALYZED_OUTPUT_DIR:-/data/analyzed}:/data/analyzed
+      - ${LOG_DIR:-/data/logs}:/data/logs
+    depends_on:
+      - logic_gate
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # RAG-Chat – FastAPI Such-Interface auf Basis MariaDB Vektor-Suche
+  # GPU 0: Tesla P100 (LLM-Inferenz für Chat-Antworten)
+  # ---------------------------------------------------------------------------
+  rag_chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rag_chat
+    container_name: doc_rag_chat
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: rag_chat
+      NVIDIA_VISIBLE_DEVICES: ${VISION_GPU_ID:-0}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${LOG_DIR:-/data/logs}:/data/logs
+    ports:
+      - "${RAG_CHAT_PORT:-8080}:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VISION_GPU_ID:-0}"]
+              capabilities: [gpu]
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    networks:
+      - doc_net
+
+networks:
+  doc_net:
+    driver: bridge
+
+volumes:
+  mariadb_data:
+
+  # ---------------------------------------------------------------------------
+  # Ollama – Lokales LLM für intelligente Voranalyse
+  # Profil "preclass": wird nur für den Pre-Classifier gestartet.
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: doc_ollama
+    profiles: ["preclass"]
+    restart: no
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${VISION_GPU_ID:-0}
+    volumes:
+      - ${OLLAMA_DATA_DIR:-/data/ollama}:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VISION_GPU_ID:-0}"]
+              capabilities: [gpu]
+    networks:
+      - doc_net
+
+  # ---------------------------------------------------------------------------
+  # Pre-Classifier – Zweiphasige KI-Voranalyse (Dokumenttypen, Tags, Kontakte)
+  # Liest Prompts und Regeln aus der DB (llm_prompts, assignment_rules).
+  # Ausgabe: Vorschlagslisten – NICHTS wird automatisch in Paperless angelegt.
+  #
+  # Verwendung:
+  #   docker compose --profile preclass up ollama          # Ollama starten
+  #   docker compose --profile preclass exec ollama \
+  #       ollama pull mistral                              # Modell laden
+  #   docker compose --profile preclass run --rm \
+  #       pre_classifier                                   # Analyse starten
+  # ---------------------------------------------------------------------------
+  pre_classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: pre_classifier
+    container_name: doc_pre_classifier
+    profiles: ["preclass"]
+    restart: no
+    env_file: .env
+    environment:
+      SERVICE_NAME: pre_classifier
+      NVIDIA_VISIBLE_DEVICES: "none"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ${SCAN_INPUT_DIR:-/data/scans}:/data/scans:ro
+      - ${TMP_DIR:-/data/tmp}:/data/tmp
+      - ${LOG_DIR:-/data/logs}:/data/logs
+      - ${PRE_ANALYSIS_DIR:-/data/pre_analysis}:/data/pre_analysis
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - doc_net
+

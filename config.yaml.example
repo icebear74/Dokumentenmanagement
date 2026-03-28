@@ -1,0 +1,254 @@
+# =============================================================================
+# KI-Dokumenten-Archiv – Beispiel-Konfigurationsdatei
+# Kopiere diese Datei nach config.yaml und passe alle Werte an.
+# Diese Datei wird als Volume in die Container gemountet.
+# KEINE Werte dürfen direkt im Python-Code hardcodiert sein.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. VERZEICHNISSE / PFADE
+#    Alle Pfade beziehen sich auf den HOST-Rechner und werden per Volume-Mount
+#    in die Container weitergeleitet.
+# ---------------------------------------------------------------------------
+paths:
+  # Eingangsordner: Hier legt der Scanner die rohen PDF/TIF-Scans ab.
+  scan_input_dir: /data/scans
+
+  # Zwischenablage nach der Patch-T-Erkennung und dem Splitting.
+  split_output_dir: /data/split
+
+  # Ordner für analysierte Dokumente (mit Metadaten-Sidecar-JSON).
+  analyzed_output_dir: /data/analyzed
+
+  # Quarantäne für Dokumente, die den confidence_threshold nicht erreichen.
+  quarantine_dir: /data/quarantine
+
+  # Persistenter Speicher für die MariaDB-Daten (Host-Pfad für Docker Volume).
+  db_data_dir: /data/mariadb
+
+  # Speicherort für Paperless-ngx Consume-Verzeichnis (falls direktes Einlegen
+  # statt REST-API gewünscht wird).
+  paperless_consume_dir: /data/paperless/consume
+
+  # Verzeichnis für temporäre Arbeitsdateien der KI-Pipeline.
+  tmp_dir: /data/tmp
+
+# ---------------------------------------------------------------------------
+# 2. GPU-ZUWEISUNG
+#    Steuert, welche GPU jeder Dienst nutzt.
+#    Wert: Ganzzahl (Device-ID) oder "none" für CPU-Betrieb.
+# ---------------------------------------------------------------------------
+gpu:
+  # GPU 0 (Tesla P100) – Vision-Analyse und LLM-Inferenz.
+  vision_gpu_id: 0
+
+  # GPU 1 (Tesla P4) – Text-Embeddings (Sentence-Transformers).
+  embedding_gpu_id: 1
+
+  # Fallback auf CPU, wenn keine GPU verfügbar ist (true/false).
+  allow_cpu_fallback: false
+
+# ---------------------------------------------------------------------------
+# 3. KI-SCHWELLENWERTE
+#    Steuern das Verhalten der KI-Analyse-Pipeline.
+# ---------------------------------------------------------------------------
+ai:
+  # Minimale Konfidenz (0.0–1.0) für die Metadaten-Extraktion.
+  # Dokumente unterhalb dieses Werts landen in quarantine_dir.
+  confidence_threshold: 0.75
+
+  # Minimale Konfidenz für OCR-Ergebnisse (Tesseract / Vision-LLM).
+  ocr_confidence_threshold: 0.80
+
+  # Sprache für OCR (ISO 639-3, z. B. deu, eng, fra).
+  ocr_language: deu
+
+  # Modell-ID für die Metadaten-Extraktion (Hugging Face oder lokaler Pfad).
+  llm_model_id: "mistralai/Mistral-7B-Instruct-v0.2"
+
+  # Modell-ID für die Text-Embeddings (muss 768-dim ausgeben).
+  embedding_model_id: "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+
+  # Maximale Tokenlänge für LLM-Prompts.
+  llm_max_tokens: 512
+
+  # Batch-Größe für Embedding-Generierung.
+  embedding_batch_size: 32
+
+# ---------------------------------------------------------------------------
+# 4. PERSONEN / EMPFÄNGER-LOGIK
+#    Die Logic-Gate-Komponente nutzt diese Namen, um eingehende Dokumente
+#    dem richtigen Empfänger zuzuordnen.
+#    Groß-/Kleinschreibung wird ignoriert beim Abgleich.
+# ---------------------------------------------------------------------------
+persons:
+  # Vollständige Namen für den primären Nutzer ("Ich").
+  # Mehrere Einträge möglich.
+  me:
+    - "Max Mustermann"
+    - "M. Mustermann"
+
+  # Vollständige Namen für weitere Empfänger.
+  partner:
+    - "Erika Musterfrau"
+    - "E. Musterfrau"
+
+  # Weitere Empfänger-Kategorien können beliebig hinzugefügt werden:
+  # company:
+  #   - "Musterfirma GmbH"
+
+# ---------------------------------------------------------------------------
+# 5. TAG-MAPPING
+#    Ordnet erkannte Dokumenttypen Paperless-ngx Tags zu.
+#    Schlüssel: interner Dokumenttyp (von der KI erkannt)
+#    Wert: Paperless-ngx Tag-Name (muss in Paperless existieren)
+# ---------------------------------------------------------------------------
+tag_mapping:
+  Rechnung: "Rechnung"
+  Kontoauszug: "Kontoauszug"
+  Versicherung: "Versicherung"
+  Behördenpost: "Behörde"
+  Arztbrief: "Gesundheit"
+  Vertrag: "Vertrag"
+  Werbung: "Werbung"
+  Sonstiges: "Unsortiert"
+
+# ---------------------------------------------------------------------------
+# 6. DATENBANK (MariaDB 11.7)
+# ---------------------------------------------------------------------------
+database:
+  host: mariadb
+  port: 3306
+  name: document_archive
+  user: archive_user
+  # WICHTIG: Passwort über Umgebungsvariable DB_PASSWORD setzen,
+  # nicht direkt hier eintragen!
+  # Das Feld wird aus der Env-Var DB_PASSWORD gelesen, falls leer.
+  password: ""
+
+  # Verbindungs-Pool-Größe.
+  pool_size: 5
+
+  # HNSW-Index Parameter für Vektorsuche.
+  hnsw_m: 16          # Anzahl der Verbindungen pro Knoten (16–64 empfohlen).
+  hnsw_ef_search: 64  # Suchtiefe bei Anfragen (höher = genauer, langsamer).
+
+# ---------------------------------------------------------------------------
+# 7. PAPERLESS-NGX REST-API
+# ---------------------------------------------------------------------------
+paperless:
+  base_url: "http://paperless-ngx:8000"
+  # API-Token über Env-Var PAPERLESS_API_TOKEN setzen.
+  api_token: ""
+  # Standard-Dokumententyp, falls die KI keine Zuordnung findet.
+  default_document_type: "Eingehend"
+
+# ---------------------------------------------------------------------------
+# 8. WATCHER-EINSTELLUNGEN
+# ---------------------------------------------------------------------------
+watcher:
+  # Scanauflösung (DPI), die der Scanner liefert. Dient zur Qualitätsprüfung.
+  expected_dpi: 600
+
+  # Polling-Intervall in Sekunden, wenn kein inotify verfügbar ist.
+  poll_interval_seconds: 5
+
+  # Minimale Dateigröße in Bytes, bevor eine Datei als vollständig gilt.
+  min_file_size_bytes: 10240
+
+  # Warte-Zeit in Sekunden nach der letzten Dateiänderung (stabile Datei).
+  file_stable_wait_seconds: 3
+
+# ---------------------------------------------------------------------------
+# 9. RAG-CHAT API (FastAPI)
+# ---------------------------------------------------------------------------
+rag_chat:
+  host: "0.0.0.0"
+  port: 8080
+  # Anzahl der Ergebnisse, die bei einer Vektorsuche zurückgegeben werden.
+  top_k_results: 5
+  # CORS-Ursprünge (kommagetrennte Liste oder "*" für alle).
+  cors_origins: "*"
+
+# ---------------------------------------------------------------------------
+# 11. DATENBANKBASIERTE REGELN & PROMPT-CACHE
+#     Alle Zuweisungsregeln und LLM-Prompts kommen aus der Datenbank.
+#     Änderungen wirken nach dem nächsten Cache-Refresh, ohne Neustart.
+#
+#     Regeln verwalten (direkt in MariaDB):
+#
+#     -- Neue Person als Empfänger "me" anlegen:
+#     INSERT INTO assignment_rules
+#       (rule_type, match_field, match_value, match_mode, assign_value, priority)
+#     VALUES ('recipient', 'recipient_name', 'Max Mustermann', 'exact', 'me', 100);
+#
+#     -- Alle aktiven Regeln anzeigen (nach Priorität):
+#     SELECT id, rule_type, match_field, match_value, assign_value, priority
+#     FROM assignment_rules WHERE is_active=1 ORDER BY priority DESC;
+#
+#     -- Regel deaktivieren (nicht löschen!):
+#     UPDATE assignment_rules SET is_active=0 WHERE id=<id>;
+#
+#     -- Prompt anpassen (z.B. ai_analyzer verfeinern):
+#     UPDATE llm_prompts SET content='...neuer Prompt...'
+#     WHERE service='ai_analyzer' AND name='default' AND prompt_type='user_template';
+# ---------------------------------------------------------------------------
+rules_cache:
+  # Cache-TTL in Sekunden: nach dieser Zeit werden Regeln/Prompts neu geladen.
+  # Niedrig (10–30s): Änderungen wirken schnell, etwas mehr DB-Last.
+  # Hoch (120–3600s): Weniger DB-Last, Änderungen wirken verzögert.
+  ttl_seconds: 60
+
+  # Beim Start: Standard-Prompts in DB eintragen (INSERT IGNORE).
+  # Bestehende, angepasste Einträge werden NICHT überschrieben.
+  seed_defaults_on_startup: true
+
+  # Beim Start: Personen aus config.yaml als Empfänger-Regeln in DB eintragen.
+  # Nur wenn noch keine Empfänger-Regeln in der DB vorhanden sind.
+  seed_persons_to_db: true
+
+# ---------------------------------------------------------------------------
+# 12. PRE-KLASSIFIZIERUNG (Voranalyse vor dem ersten Pipeline-Durchlauf)
+#     Einmalig ausführen, um Tags und Kontakte aus den Dokumenten zu entdecken.
+#     Ausgabe: NUR VORSCHLAGSLISTEN – keine automatische Paperless-Anlage.
+#
+#     Aufruf:
+#       docker compose --profile preclass up ollama
+#       docker compose --profile preclass exec ollama ollama pull mistral
+#       docker compose --profile preclass run --rm pre_classifier
+# ---------------------------------------------------------------------------
+pre_classifier:
+  # LLM-Backend: "ollama" (lokal, empfohlen für Datenschutz) oder "openai"
+  llm_backend: ollama
+
+  # Ollama-Einstellungen
+  # Modell-Empfehlungen (nach Qualität, lokal):
+  #   mistral      – 7B, gut für Deutsch, schnell (~4 GB VRAM)
+  #   llama3.1     – 8B, sehr gut, mehrsprachig (~5 GB VRAM)
+  #   phi4         – 14B, hervorragend, weniger VRAM (~9 GB VRAM)
+  #   llama3.3:70b – beste Qualität, benötigt ~40 GB VRAM
+  ollama_base_url: "http://ollama:11434"
+  ollama_model: "mistral"
+
+  # OpenAI-Einstellungen (benötigt OPENAI_API_KEY als Umgebungsvariable)
+  # Vorteil: Beste Erkennungsqualität, kein lokales Modell nötig.
+  # Datenschutz-Hinweis: Dokumentinhalt wird an OpenAI übermittelt!
+  openai_model: "gpt-4o-mini"
+
+  # Bei LLM-Ausfall trotzdem weitermachen (leere Ergebnisse statt Abbruch)
+  allow_llm_fallback: true
+
+  # Ausgabeverzeichnis für JSON-Bericht
+  report_output_dir: /data/pre_analysis
+
+  # Maximale Dokumente pro Kontext-Synthese-Batch (Phase 2)
+  # Größere Batches = bessere Mustererkennung, aber längere Antwortzeiten
+  synthesis_batch_size: 25
+
+logging:
+  # Log-Level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: INFO
+  # Log-Format: json (für Log-Aggregatoren) oder text (für Menschen)
+  format: json
+  # Log-Ausgabe: stdout und/oder Datei
+  log_file: /data/logs/archive.log
