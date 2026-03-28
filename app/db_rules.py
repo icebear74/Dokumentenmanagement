@@ -43,7 +43,8 @@ class AssignmentRule:
     id: int
     rule_type: str        # 'recipient' | 'tag' | 'correspondent'
     match_field: str      # 'sender' | 'recipient_name' | 'document_type' |
-    #                       'organization' | 'keyword'
+    #                       'organization' | 'keyword' | 'llm_tag'
+    #                       'llm_tag' prüft gegen LLM-extrahierte topic_tags
     match_value: str      # Zu suchender Wert (case-insensitive)
     match_mode: str       # 'exact' | 'contains' | 'startswith' | 'regex'
     assign_value: str     # Zuzuweisender Wert
@@ -207,19 +208,25 @@ def apply_rules(
 ) -> dict[str, list[str]]:
     """Wendet Zuweisungsregeln auf ein Dokument an.
 
+    Die LLM-extrahierten `topic_tags` werden IMMER direkt als Tags
+    übernommen (höchste semantische Relevanz). DB-Regeln ergänzen diese
+    um strukturelle Tags (Dokumenttyp, Schlüsselwörter) und bestimmen
+    Empfänger und Korrespondenten.
+
     Args:
         doc_fields: Dict mit Feldern des Dokuments:
             - sender (str)
             - recipient_names (list[str])
             - document_type (str)
+            - topic_tags (list[str])  – direkt vom LLM; werden als Tags übernommen
             - organizations (list[str])
             - ocr_text (str, optional – für keyword-Regeln)
         rules: Sortierte Liste aktiver AssignmentRule (priority DESC).
 
     Returns:
         Dict mit Listen der zugewiesenen Werte:
-            - recipient:     Nur der erste Treffer (höchste Priorität)
-            - tags:          Alle Treffer, dedupliziert
+            - recipient:      Nur der erste Treffer (höchste Priorität)
+            - tags:           LLM topic_tags + alle Rule-Treffer, dedupliziert
             - correspondents: Alle Treffer, dedupliziert
     """
     sender = str(doc_fields.get("sender") or "").strip()
@@ -227,14 +234,19 @@ def apply_rules(
     recipient_names: list[str] = [
         str(n) for n in doc_fields.get("recipient_names", []) if n
     ]
+    topic_tags: list[str] = [
+        str(t).strip() for t in doc_fields.get("topic_tags", []) if t
+    ]
     organizations: list[str] = [
         str(o) for o in doc_fields.get("organizations", []) if o
     ]
     ocr_text = str(doc_fields.get("ocr_text") or "")
 
+    # LLM-Tags sind die primäre, semantisch reichhaltige Quelle –
+    # direkt übernehmen, kein Regelabgleich nötig.
     result: dict[str, list[str]] = {
         "recipient": [],
-        "tags": [],
+        "tags": list(topic_tags),          # LLM-Tags sofort einsetzen
         "correspondents": [],
     }
 
@@ -250,6 +262,9 @@ def apply_rules(
             targets = organizations
         elif rule.match_field == "keyword":
             targets = [ocr_text] if ocr_text else []
+        elif rule.match_field == "llm_tag":
+            # Prüfe gegen die LLM-extrahierten topic_tags
+            targets = topic_tags
         else:
             continue
 
